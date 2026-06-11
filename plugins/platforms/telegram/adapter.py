@@ -10,6 +10,7 @@ Uses python-telegram-bot library for:
 import asyncio
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -363,6 +364,27 @@ def _probe_voice_duration_seconds(path: str) -> Optional[int]:
         pass
 
     return None
+
+
+_TELEGRAM_AUDIO_DOCUMENT_TYPES = {
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
+_TELEGRAM_AUDIO_MIME_TO_EXT = {
+    **{_mime: _ext for _ext, _mime in _TELEGRAM_AUDIO_DOCUMENT_TYPES.items()},
+    "audio/mp3": ".mp3",
+    "audio/x-m4a": ".m4a",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/x-flac": ".flac",
+    "audio/opus": ".opus",
+}
 
 
 def check_telegram_requirements() -> bool:
@@ -729,6 +751,30 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._drop_delayed_deliveries = False
+        self._ingress_batch_delay_seconds = self._coerce_float_extra(
+            "ingress_batch_seconds",
+            self._env_float_clamped(
+                "HERMES_TELEGRAM_INGRESS_BATCH_SECONDS",
+                0.0,
+                min_value=0.0,
+                max_value=2.0,
+            ),
+            min_value=0.0,
+            max_value=2.0,
+        )
+        self._ingress_batch_hard_cap_seconds = self._coerce_float_extra(
+            "ingress_batch_hard_cap_seconds",
+            self._env_float_clamped(
+                "HERMES_TELEGRAM_INGRESS_BATCH_HARD_CAP_SECONDS",
+                max(self._ingress_batch_delay_seconds, 1.5),
+                min_value=max(self._ingress_batch_delay_seconds, 0.0),
+                max_value=4.0,
+            ),
+            min_value=max(self._ingress_batch_delay_seconds, 0.0),
+            max_value=4.0,
+        )
+        self._pending_ingress_batches: Dict[str, MessageEvent] = {}
+        self._pending_ingress_batch_tasks: Dict[str, asyncio.Task] = {}
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
@@ -1451,18 +1497,23 @@ class TelegramAdapter(BasePlatformAdapter):
         min_value: Optional[float] = None,
         max_value: Optional[float] = None,
     ) -> float:
+        import math
+
         value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
         if value is None:
-            return default
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return default
+            result = float(default)
+        else:
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                result = float(default)
+        if not math.isfinite(result):
+            result = float(default)
         if min_value is not None:
-            parsed = max(parsed, min_value)
+            result = max(result, min_value)
         if max_value is not None:
-            parsed = min(parsed, max_value)
-        return parsed
+            result = min(result, max_value)
+        return result
 
     def _link_preview_kwargs(self) -> Dict[str, Any]:
         if not getattr(self, "_disable_link_previews", False):
@@ -7514,7 +7565,9 @@ class TelegramAdapter(BasePlatformAdapter):
         outbound routing must all agree on the same normalized value.
         """
         chat = getattr(message, "chat", None)
-        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        raw_chat_type = getattr(chat, "type", "") if chat else ""
+        chat_type_value = getattr(raw_chat_type, "value", raw_chat_type)
+        chat_type = str(chat_type_value).split(".")[-1].lower()
         raw = getattr(message, "message_thread_id", None)
         is_topic_message = bool(getattr(message, "is_topic_message", False))
         is_forum_group = chat_type in ("group", "supergroup") and getattr(chat, "is_forum", False) is True
@@ -8186,7 +8239,10 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        self._enqueue_text_event(event)
+        if getattr(self, "_ingress_batch_delay_seconds", 0.0):
+            self._enqueue_ingress_event(event)
+        else:
+            self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -8256,6 +8312,118 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
+
+    # ------------------------------------------------------------------
+    # Optional ingress batching (text + media in one Telegram turn)
+    # ------------------------------------------------------------------
+
+    def _ingress_batch_key(self, event: MessageEvent) -> str:
+        """Return a strict ingress-batch key: platform/profile/chat/thread/user."""
+        self._apply_topic_recovery(event)
+        source = event.source
+        platform = getattr(getattr(source, "platform", None), "value", None) or getattr(source, "platform", None)
+        profile = os.getenv("HERMES_PROFILE") or os.getenv("HERMES_ACTIVE_PROFILE") or "default"
+        return ":".join(
+            str(part or "")
+            for part in (
+                platform,
+                profile,
+                getattr(source, "chat_id", None),
+                getattr(source, "thread_id", None),
+                getattr(source, "user_id", None),
+            )
+        )
+
+    @staticmethod
+    def _ingress_batch_log_id(key: str) -> str:
+        """Stable non-secret session id for ingress-batch logs."""
+        return hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+    @staticmethod
+    def _merge_ingress_event(existing: MessageEvent, event: MessageEvent) -> None:
+        """Merge a same-key Telegram ingress event while preserving order."""
+        if event.text:
+            existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+        if event.media_urls:
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+        if existing.message_type != MessageType.PHOTO:
+            if event.message_type == MessageType.PHOTO:
+                existing.message_type = MessageType.PHOTO
+            elif existing.message_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
+                existing.message_type = event.message_type
+        if getattr(event, "message_id", None):
+            existing.message_id = event.message_id
+            existing.source.message_id = getattr(event.source, "message_id", existing.source.message_id)
+
+    def _enqueue_ingress_event(self, event: MessageEvent) -> None:
+        """Buffer one Telegram ingress item before creating the agent turn."""
+        delay_cap = float(getattr(self, "_ingress_batch_delay_seconds", 0.0) or 0.0)
+        if delay_cap <= 0:
+            asyncio.create_task(self.handle_message(event))
+            return
+
+        key = self._ingress_batch_key(event)
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        existing = self._pending_ingress_batches.get(key)
+        if existing is None:
+            event._ingress_first_ts = now  # type: ignore[attr-defined]
+            event._ingress_item_count = 1  # type: ignore[attr-defined]
+            event._ingress_text_parts = 1 if event.text else 0  # type: ignore[attr-defined]
+            self._pending_ingress_batches[key] = event
+        else:
+            self._merge_ingress_event(existing, event)
+            existing._ingress_item_count = int(getattr(existing, "_ingress_item_count", 1)) + 1  # type: ignore[attr-defined]
+            existing._ingress_text_parts = int(getattr(existing, "_ingress_text_parts", 1 if existing.text else 0)) + (1 if event.text else 0)  # type: ignore[attr-defined]
+
+        logger.info(
+            "[Telegram] ingress_batch_add type=%s session=%s",
+            getattr(event.message_type, "value", event.message_type),
+            self._ingress_batch_log_id(key),
+        )
+
+        prior_task = self._pending_ingress_batch_tasks.get(key)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+        self._pending_ingress_batch_tasks[key] = asyncio.create_task(
+            self._flush_ingress_batch(key)
+        )
+
+    def _dispatch_or_enqueue_ingress(self, event: MessageEvent) -> None:
+        if getattr(self, "_ingress_batch_delay_seconds", 0.0):
+            self._enqueue_ingress_event(event)
+        else:
+            asyncio.create_task(self.handle_message(event))
+
+    async def _flush_ingress_batch(self, key: str) -> None:
+        """Flush a bounded ingress batch as one MessageEvent/agent turn."""
+        current_task = asyncio.current_task()
+        try:
+            pending = self._pending_ingress_batches.get(key)
+            if not pending:
+                return
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            first_ts = float(getattr(pending, "_ingress_first_ts", now))
+            delay_cap = float(getattr(self, "_ingress_batch_delay_seconds", 0.0) or 0.0)
+            hard_cap = float(getattr(self, "_ingress_batch_hard_cap_seconds", delay_cap) or delay_cap)
+            flush_at = min(now + delay_cap, first_ts + max(hard_cap, delay_cap))
+            await asyncio.sleep(max(0.0, flush_at - now))
+            event = self._pending_ingress_batches.pop(key, None)
+            if not event:
+                return
+            logger.info(
+                "[Telegram] ingress_batch_flush session=%s items=%d text_parts=%d attachments=%d source=batch",
+                self._ingress_batch_log_id(key),
+                int(getattr(event, "_ingress_item_count", 1)),
+                int(getattr(event, "_ingress_text_parts", 1 if event.text else 0)),
+                len(event.media_urls or []),
+            )
+            await self.handle_message(event)
+        finally:
+            if self._pending_ingress_batch_tasks.get(key) is current_task:
+                self._pending_ingress_batch_tasks.pop(key, None)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Telegram client-side splits)
@@ -8485,8 +8653,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 if media_group_id:
                     await self._queue_media_group_event(str(media_group_id), event)
                 else:
-                    batch_key = self._photo_batch_key(event, msg)
-                    self._enqueue_photo_event(batch_key, event)
+                    if getattr(self, "_ingress_batch_delay_seconds", 0.0):
+                        self._enqueue_ingress_event(event)
+                    else:
+                        batch_key = self._photo_batch_key(event, msg)
+                        self._enqueue_photo_event(batch_key, event)
                 return
 
             except Exception as e:
@@ -8614,8 +8785,35 @@ class TelegramAdapter(BasePlatformAdapter):
                     if media_group_id:
                         await self._queue_media_group_event(str(media_group_id), event)
                     else:
-                        batch_key = self._photo_batch_key(event, msg)
-                        self._enqueue_photo_event(batch_key, event)
+                        if getattr(self, "_ingress_batch_delay_seconds", 0.0):
+                            self._enqueue_ingress_event(event)
+                        else:
+                            batch_key = self._photo_batch_key(event, msg)
+                            self._enqueue_photo_event(batch_key, event)
+                    return
+
+                # Telegram may deliver audio files as generic documents when
+                # the user attaches them through the file picker. Route those
+                # through the audio cache and MessageType.AUDIO so the agent
+                # receives a usable path instead of an unsupported-document
+                # error. Voice-note STT remains separate: only MessageType.VOICE
+                # is auto-transcribed by the runner.
+                if not ext and doc_mime:
+                    ext = _TELEGRAM_AUDIO_MIME_TO_EXT.get(doc_mime, "")
+
+                if ext in _TELEGRAM_AUDIO_DOCUMENT_TYPES or doc_mime.startswith("audio/"):
+                    file_obj = await doc.get_file()
+                    audio_bytes = await file_obj.download_as_bytearray()
+                    audio_ext = ext if ext in _TELEGRAM_AUDIO_DOCUMENT_TYPES else _TELEGRAM_AUDIO_MIME_TO_EXT.get(doc_mime, ".wav")
+                    cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=audio_ext)
+                    event.message_type = MessageType.AUDIO
+                    event.media_urls = [cached_path]
+                    event.media_types = [doc_mime if doc_mime.startswith("audio/") else _TELEGRAM_AUDIO_DOCUMENT_TYPES.get(audio_ext, "audio/mpeg")]
+                    logger.info("[Telegram] Cached user audio-document at %s", cached_path)
+                    if getattr(self, "_ingress_batch_delay_seconds", 0.0):
+                        self._enqueue_ingress_event(event)
+                    else:
+                        await self.handle_message(event)
                     return
 
                 if not ext and doc.mime_type:
@@ -8638,7 +8836,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    await self.handle_message(event)
+                    if getattr(self, "_ingress_batch_delay_seconds", 0.0):
+                        self._enqueue_ingress_event(event)
+                    else:
+                        await self.handle_message(event)
                     return
 
                 # NOTE: image-document handling is performed earlier in this
@@ -8694,7 +8895,10 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._queue_media_group_event(str(media_group_id), event)
             return
 
-        await self.handle_message(event)
+        if getattr(self, "_ingress_batch_delay_seconds", 0.0):
+            self._enqueue_ingress_event(event)
+        else:
+            await self.handle_message(event)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
@@ -8734,7 +8938,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 if self._should_drop_delayed_delivery():
                     logger.debug("[Telegram] Dropping media group flush after disconnect started")
                     return
-                await self.handle_message(event)
+                if getattr(self, "_ingress_batch_delay_seconds", 0.0):
+                    self._enqueue_ingress_event(event)
+                else:
+                    await self.handle_message(event)
         except asyncio.CancelledError:
             return
         finally:
@@ -8994,14 +9201,18 @@ class TelegramAdapter(BasePlatformAdapter):
         chat = message.chat
         user = message.from_user
         
-        # Determine chat type.  Normalize through ``str`` so tests/mocks and
-        # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
-        # string-like, but mocks often provide plain strings).
-        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        # Determine chat type.  Prefer direct ChatType equality where possible
+        # so tests/mocks that import the adapter before swapping fake telegram
+        # modules don't depend on a particular enum ``str()`` representation.
+        # Fall back to ``.value`` / string normalization for plain strings and
+        # lightweight fakes.
+        raw_chat_type = getattr(chat, "type", "")
+        telegram_chat_type_value = getattr(raw_chat_type, "value", raw_chat_type)
+        telegram_chat_type = str(telegram_chat_type_value).split(".")[-1].lower()
         chat_type = "dm"
-        if telegram_chat_type in {"group", "supergroup"}:
+        if raw_chat_type in {getattr(ChatType, "GROUP", None), getattr(ChatType, "SUPERGROUP", None)} or telegram_chat_type in {"group", "supergroup"}:
             chat_type = "group"
-        elif telegram_chat_type == "channel":
+        elif raw_chat_type == getattr(ChatType, "CHANNEL", None) or telegram_chat_type == "channel":
             chat_type = "channel"
 
         # Resolve routable thread id for DM topics and forum group topics via
@@ -9012,6 +9223,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # forum General-topic messages (message_thread_id=None) normalize to
         # the General-topic id so replies route back to General (#22423).
         thread_id_str = self._effective_message_thread_id(message)
+        if thread_id_str is None and chat_type == "group" and getattr(chat, "is_forum", False) is True:
+            raw_thread_id = getattr(message, "message_thread_id", None)
+            thread_id_str = str(raw_thread_id) if raw_thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
         chat_topic = None
         topic_skill = None
 

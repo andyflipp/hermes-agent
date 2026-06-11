@@ -207,3 +207,74 @@ def test_telegram_media_type_detection_audio_vs_voice():
     assert MessageType.VOICE.value == "voice"
     # Sanity: they are distinct
     assert MessageType.AUDIO != MessageType.VOICE
+
+
+# ---------------------------------------------------------------------------
+# 5. Telegram document uploads with audio MIME/extensions should become AUDIO
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_telegram_wav_document_routes_as_audio_attachment():
+    """A .wav sent through Telegram's document/file picker must not be rejected."""
+    from types import SimpleNamespace
+
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    class FakeFile:
+        file_path = "sample.wav"
+
+        async def download_as_bytearray(self):
+            return bytearray(b"RIFF....WAVE")
+
+    class FakeDocument:
+        file_name = "sample.wav"
+        mime_type = "audio/wav"
+        file_size = 12
+
+        async def get_file(self):
+            return FakeFile()
+
+    msg = SimpleNamespace(
+        sticker=None,
+        photo=None,
+        video=None,
+        audio=None,
+        voice=None,
+        document=FakeDocument(),
+        caption="please transcribe",
+        media_group_id=None,
+    )
+    update = SimpleNamespace(message=msg, update_id=1001)
+
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter._max_doc_bytes = 32 * 1024 * 1024
+    adapter._ingress_batch_delay_seconds = 0.0
+    adapter._should_process_message = lambda message, *, is_command=False: True
+    adapter._clean_bot_trigger_text = lambda text: text
+    adapter._apply_telegram_group_observe_attribution = lambda event: event
+    adapter._build_message_event = lambda message, msg_type, update_id=None: MessageEvent(
+        text="",
+        message_type=msg_type,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
+    )
+
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    adapter.handle_message = fake_handle_message
+
+    with patch(
+        "plugins.platforms.telegram.adapter.cache_audio_from_bytes",
+        return_value="/tmp/hermes-cache/sample.wav",
+    ) as cache_audio:
+        await adapter._handle_media_message(update, context=None)
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.message_type == MessageType.AUDIO
+    assert event.media_urls == ["/tmp/hermes-cache/sample.wav"]
+    assert event.media_types == ["audio/wav"]
+    assert event.text == "please transcribe"
+    cache_audio.assert_called_once_with(b"RIFF....WAVE", ext=".wav")

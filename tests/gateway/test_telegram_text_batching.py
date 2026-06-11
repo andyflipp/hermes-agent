@@ -43,6 +43,10 @@ def _make_adapter():
     adapter._set_status_indicator = AsyncMock()
     adapter._release_platform_lock = lambda: None
     adapter._text_batch_delay_seconds = 0.1  # fast for tests
+    adapter._ingress_batch_delay_seconds = 0.1  # fast for tests
+    adapter._ingress_batch_hard_cap_seconds = 0.2
+    adapter._pending_ingress_batches = {}
+    adapter._pending_ingress_batch_tasks = {}
     adapter._active_sessions = {}
     adapter._pending_messages = {}
     adapter._message_handler = AsyncMock()
@@ -50,11 +54,11 @@ def _make_adapter():
     return adapter
 
 
-def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
+def _make_event(text: str, chat_id: str = "12345", user_id: str = "user-1") -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"),
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm", user_id=user_id),
     )
 
 
@@ -326,3 +330,177 @@ class TestTextBatching:
         assert adapter._media_group_events == {}
         assert adapter._media_group_tasks == {}
         assert adapter._polling_error_task is None
+
+
+class TestIngressBatching:
+    @pytest.mark.asyncio
+    async def test_three_text_messages_preserve_order_in_one_turn(self):
+        adapter = _make_adapter()
+
+        adapter._enqueue_ingress_event(_make_event("one", chat_id="111"))
+        await asyncio.sleep(0.02)
+        adapter._enqueue_ingress_event(_make_event("two", chat_id="111"))
+        await asyncio.sleep(0.02)
+        adapter._enqueue_ingress_event(_make_event("three", chat_id="111"))
+
+        await asyncio.sleep(0.15)
+
+        adapter.handle_message.assert_called_once()
+        assert adapter.handle_message.call_args[0][0].text == "one\ntwo\nthree"
+
+    @pytest.mark.asyncio
+    async def test_text_and_document_same_user_same_chat_flush_as_one_turn(self):
+        adapter = _make_adapter()
+        text_event = _make_event("task text", chat_id="111")
+        doc_event = MessageEvent(
+            text="[The user sent a document: guide.pdf]",
+            message_type=MessageType.DOCUMENT,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="111",
+                chat_type="dm",
+                user_id="user-1",
+            ),
+            media_urls=["/tmp/guide.pdf"],
+            media_types=["application/pdf"],
+        )
+
+        adapter._enqueue_ingress_event(text_event)
+        await asyncio.sleep(0.02)
+        adapter._enqueue_ingress_event(doc_event)
+
+        adapter.handle_message.assert_not_called()
+        await asyncio.sleep(0.15)
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert dispatched.text == "task text\n[The user sent a document: guide.pdf]"
+        assert dispatched.media_urls == ["/tmp/guide.pdf"]
+        assert dispatched.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_text_and_image_same_user_same_chat_flush_as_one_turn(self):
+        adapter = _make_adapter()
+        text_event = _make_event("look at this", chat_id="111")
+        image_event = MessageEvent(
+            text="caption",
+            message_type=MessageType.PHOTO,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="111",
+                chat_type="dm",
+                user_id="user-1",
+            ),
+            media_urls=["/tmp/image.jpg"],
+            media_types=["image/jpeg"],
+        )
+
+        adapter._enqueue_ingress_event(text_event)
+        await asyncio.sleep(0.02)
+        adapter._enqueue_ingress_event(image_event)
+
+        await asyncio.sleep(0.15)
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert dispatched.message_type == MessageType.PHOTO
+        assert dispatched.text == "look at this\ncaption"
+        assert dispatched.media_urls == ["/tmp/image.jpg"]
+        assert dispatched.media_types == ["image/jpeg"]
+
+    @pytest.mark.asyncio
+    async def test_two_documents_same_user_same_chat_flush_as_one_turn(self):
+        adapter = _make_adapter()
+        first = MessageEvent(
+            text="first file",
+            message_type=MessageType.DOCUMENT,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="111",
+                chat_type="dm",
+                user_id="user-1",
+            ),
+            media_urls=["/tmp/a.pdf"],
+            media_types=["application/pdf"],
+        )
+        second = MessageEvent(
+            text="second file",
+            message_type=MessageType.DOCUMENT,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="111",
+                chat_type="dm",
+                user_id="user-1",
+            ),
+            media_urls=["/tmp/b.csv"],
+            media_types=["text/csv"],
+        )
+
+        adapter._enqueue_ingress_event(first)
+        await asyncio.sleep(0.02)
+        adapter._enqueue_ingress_event(second)
+
+        await asyncio.sleep(0.15)
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert dispatched.text == "first file\nsecond file"
+        assert dispatched.media_urls == ["/tmp/a.pdf", "/tmp/b.csv"]
+        assert dispatched.media_types == ["application/pdf", "text/csv"]
+
+    @pytest.mark.asyncio
+    async def test_ingress_batches_are_split_by_user_chat_and_thread(self):
+        adapter = _make_adapter()
+        base = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="111",
+            chat_type="dm",
+            user_id="user-1",
+            thread_id="topic-a",
+        )
+        same_chat_other_user = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="111",
+            chat_type="dm",
+            user_id="user-2",
+            thread_id="topic-a",
+        )
+        same_user_other_thread = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="111",
+            chat_type="dm",
+            user_id="user-1",
+            thread_id="topic-b",
+        )
+
+        for text, source in (
+            ("base", base),
+            ("other user", same_chat_other_user),
+            ("other thread", same_user_other_thread),
+        ):
+            adapter._enqueue_ingress_event(
+                MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+            )
+
+        await asyncio.sleep(0.15)
+
+        assert adapter.handle_message.call_count == 3
+        texts = sorted(call.args[0].text for call in adapter.handle_message.call_args_list)
+        assert texts == ["base", "other thread", "other user"]
+
+    @pytest.mark.asyncio
+    async def test_message_after_hard_cap_starts_new_turn(self):
+        adapter = _make_adapter()
+        adapter._ingress_batch_delay_seconds = 0.05
+        adapter._ingress_batch_hard_cap_seconds = 0.08
+
+        adapter._enqueue_ingress_event(_make_event("first", chat_id="111"))
+        await asyncio.sleep(0.12)
+        adapter._enqueue_ingress_event(_make_event("late", chat_id="111"))
+        await asyncio.sleep(0.08)
+
+        assert adapter.handle_message.call_count == 2
+        assert [call.args[0].text for call in adapter.handle_message.call_args_list] == [
+            "first",
+            "late",
+        ]
