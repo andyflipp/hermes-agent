@@ -176,6 +176,12 @@ class SessionSource:
     guild_id: Optional[str] = None  # @deprecated legacy alias for scope_id (D-Q2.5)
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    # Telegram Business / Secretary Mode routing context.  These are not
+    # credentials; they are Bot API routing identifiers needed to send replies
+    # through the same approved business connection that produced the update.
+    telegram_business_connection_id: Optional[str] = None
+    telegram_business_user_chat_id: Optional[str] = None
+    telegram_business_user_id: Optional[str] = None
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
     # Profile this inbound message is routed to in a multiplexing gateway
     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
@@ -262,6 +268,12 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.telegram_business_connection_id:
+            d["telegram_business_connection_id"] = self.telegram_business_connection_id
+        if self.telegram_business_user_chat_id:
+            d["telegram_business_user_chat_id"] = self.telegram_business_user_chat_id
+        if self.telegram_business_user_id:
+            d["telegram_business_user_id"] = self.telegram_business_user_id
         if self.profile:
             d["profile"] = self.profile
         if self.auto_thread_created:
@@ -288,6 +300,9 @@ class SessionSource:
             scope_id=data.get("scope_id", data.get("guild_id")),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            telegram_business_connection_id=data.get("telegram_business_connection_id"),
+            telegram_business_user_chat_id=data.get("telegram_business_user_chat_id"),
+            telegram_business_user_id=data.get("telegram_business_user_id"),
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),

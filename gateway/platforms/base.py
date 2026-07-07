@@ -54,7 +54,7 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) -> dict | None:
-    """Build platform-aware thread metadata for adapter sends.
+    """Build platform-aware thread/business metadata for adapter sends.
 
     Most platforms route threaded sends with a generic ``thread_id`` metadata
     value. Telegram private-chat topics created through Hermes' DM-topic helper
@@ -62,20 +62,28 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     user-message replies route with ``message_thread_id`` + ``reply_to_message_id``;
     synthetic/resumed sends that have no reply anchor fall back to Telegram's
     ``direct_messages_topic_id`` when the Bot API supports it.
+
+    Telegram Business / Secretary Mode can require ``business_connection_id``
+    even when there is no thread id, so this helper must not return early just
+    because ``source.thread_id`` is absent.
     """
+    metadata: dict = {}
     thread_id = getattr(source, "thread_id", None)
-    metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    if thread_id is not None:
+        metadata["thread_id"] = thread_id
+
+    platform_name = _platform_name(getattr(source, "platform", None))
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
     # WebClient after an async, stream, or recovery boundary.
-    if _platform_name(getattr(source, "platform", None)) == "slack":
+    if platform_name == "slack":
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
-    if not metadata:
-        return None
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
+
+    is_telegram = platform_name == "telegram"
+    if is_telegram and getattr(source, "chat_type", None) == "dm" and thread_id is not None:
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:
@@ -83,7 +91,21 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
-    return metadata
+
+    if is_telegram:
+        business_connection_id = getattr(source, "telegram_business_connection_id", None)
+        if business_connection_id:
+            metadata["business_connection_id"] = str(business_connection_id)
+            metadata["telegram_business_connection_id"] = str(business_connection_id)
+            chat_id = getattr(source, "chat_id", None)
+            user_chat_id = getattr(source, "telegram_business_user_chat_id", None) or chat_id
+            user_id = getattr(source, "telegram_business_user_id", None) or getattr(source, "user_id", None)
+            if user_chat_id:
+                metadata["telegram_business_user_chat_id"] = str(user_chat_id)
+            if user_id:
+                metadata["telegram_business_user_id"] = str(user_id)
+
+    return metadata or None
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -5748,6 +5770,9 @@ class BasePlatformAdapter(ABC):
         role_authorized: bool = False,
         auto_thread_created: bool = False,
         auto_thread_initial_name: Optional[str] = None,
+        telegram_business_connection_id: Optional[str] = None,
+        telegram_business_user_chat_id: Optional[str] = None,
+        telegram_business_user_id: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform.
 
@@ -5810,6 +5835,21 @@ class BasePlatformAdapter(ABC):
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
+            telegram_business_connection_id=(
+                str(telegram_business_connection_id)
+                if telegram_business_connection_id
+                else None
+            ),
+            telegram_business_user_chat_id=(
+                str(telegram_business_user_chat_id)
+                if telegram_business_user_chat_id
+                else None
+            ),
+            telegram_business_user_id=(
+                str(telegram_business_user_id)
+                if telegram_business_user_id
+                else None
+            ),
         )
         # In-process transport provenance is deliberately not serialized by
         # SessionSource.to_dict(). The live receiving adapter is authoritative
