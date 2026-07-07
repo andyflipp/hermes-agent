@@ -8603,6 +8603,66 @@ class TelegramAdapter(BasePlatformAdapter):
         return hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
     @staticmethod
+    def _utf16_offset_to_index(text: str, offset: int) -> int:
+        """Convert a Telegram UTF-16 code-unit offset to a Python index."""
+        if offset <= 0:
+            return 0
+        if utf16_len(text) <= offset:
+            return len(text)
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if utf16_len(text[:mid]) < offset:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    @classmethod
+    def _render_text_with_hidden_entity_links(cls, text: Optional[str], entities: Optional[list]) -> str:
+        """Append Telegram text_link hrefs that are otherwise invisible to the agent.
+
+        Telegram clients can render clickable text where the URL is stored only
+        in a MessageEntity(type=text_link). PTB exposes the visible text in
+        message.text/caption and the href in entity.url; if Hermes forwards only
+        the visible string, the agent cannot retrieve the linked source.
+        """
+        raw_text = text or ""
+        if not raw_text or not entities:
+            return raw_text
+
+        seen: set[tuple[str, str]] = set()
+        links: list[tuple[str, str]] = []
+        for entity in entities:
+            entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+            if entity_type != "text_link":
+                continue
+            url = str(getattr(entity, "url", "") or "").strip()
+            if not url or url in raw_text:
+                continue
+            try:
+                offset = int(getattr(entity, "offset", -1))
+                length = int(getattr(entity, "length", 0))
+            except (TypeError, ValueError):
+                continue
+            if offset < 0 or length <= 0:
+                continue
+            start = cls._utf16_offset_to_index(raw_text, offset)
+            end = cls._utf16_offset_to_index(raw_text, offset + length)
+            label = raw_text[start:end].strip() or url
+            key = (label, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(key)
+
+        if not links:
+            return raw_text
+        link_lines = ["", "[Telegram hidden links]"]
+        link_lines.extend(f"- {label}: {url}" for label, url in links)
+        return raw_text.rstrip() + "\n" + "\n".join(link_lines)
+
+    @staticmethod
     def _merge_ingress_event(existing: MessageEvent, event: MessageEvent) -> None:
         """Merge a same-key Telegram ingress event while preserving order."""
         if event.text:
@@ -8866,7 +8926,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 _observe_type = self._media_message_type(_m)
                 _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
                 if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
+                    _event.text = self._clean_bot_trigger_text(
+                        self._render_text_with_hidden_entity_links(
+                            _m.caption, getattr(_m, "caption_entities", None)
+                        )
+                    ) or ""
                 await self._cache_observed_media(_m, _event)
                 self._observe_unmentioned_group_message(
                     _m, _event.message_type, update_id=update.update_id, event=_event
@@ -8879,7 +8943,11 @@ class TelegramAdapter(BasePlatformAdapter):
         
         # Add caption as text
         if msg.caption:
-            event.text = self._clean_bot_trigger_text(msg.caption)
+            event.text = self._clean_bot_trigger_text(
+                self._render_text_with_hidden_entity_links(
+                    msg.caption, getattr(msg, "caption_entities", None)
+                )
+            ) or ""
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -9617,7 +9685,9 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         return MessageEvent(
-            text=message.text or "",
+            text=self._render_text_with_hidden_entity_links(
+                message.text or "", getattr(message, "entities", None)
+            ),
             message_type=msg_type,
             source=source,
             raw_message=message,
