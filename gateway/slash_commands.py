@@ -385,7 +385,12 @@ class GatewaySlashCommandsMixin:
                 f"Slash commands: all available"
             )
 
-        if policy.is_admin(user_id):
+        admin_candidates = [user_id]
+        if source and getattr(source, "user_name", None):
+            uname = str(source.user_name).strip()
+            if uname:
+                admin_candidates.extend([uname, uname.lstrip("@"), f"@{uname.lstrip('@')}"])
+        if any(candidate and policy.is_admin(candidate) for candidate in admin_candidates):
             return (
                 f"**You** — {platform} ({scope})\n"
                 f"User ID: `{user_id}`\n"

@@ -621,3 +621,19 @@ async def test_gating_isolated_per_platform():
     tg_src = _make_source(platform=Platform.TELEGRAM, user_id="999", chat_id="t1")
     result = await runner._handle_message(_make_event("/whoami", tg_src))
     assert "Tier: unrestricted" in result
+
+
+def test_telegram_public_username_can_be_slash_admin():
+    runner = _make_runner(
+        platform_extra={"allow_admin_from": ["@Alice"]},
+        platform=Platform.TELEGRAM,
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="t1",
+        chat_type="dm",
+        user_id="999",
+        user_name="Alice",
+    )
+
+    assert runner._check_slash_access(source, "stop") is None

@@ -14156,7 +14156,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
-        if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
+        access_candidates = [source.user_id]
+        if getattr(source, "user_name", None):
+            uname = str(source.user_name).strip()
+            if uname:
+                access_candidates.extend([uname, uname.lstrip("@"), f"@{uname.lstrip('@')}"])
+        if not policy.enabled or any(
+            candidate and policy.can_run(candidate, canonical_cmd)
+            for candidate in access_candidates
+        ):
             return None
         logger.info(
             "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",

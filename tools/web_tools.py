@@ -228,6 +228,15 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
+    if configured and configured not in _LEGACY_WEB_BACKENDS:
+        # Custom/profile-local providers are registered by plugin discovery.
+        # Ensure discovery has run before deciding whether the configured
+        # backend exists; otherwise custom extract/search backends can be
+        # skipped and the code falls back to a search-only backend.
+        try:
+            _ensure_web_plugins_loaded()
+        except NameError:
+            pass
     if configured in _LEGACY_WEB_BACKENDS or _registered_web_provider(configured) is not None:
         return configured
 
@@ -303,6 +312,15 @@ def _get_capability_backend(capability: str) -> str:
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
+    if specific and specific not in _LEGACY_WEB_BACKENDS:
+        # Same custom-provider discovery guard as _get_backend(): without this,
+        # a profile-local provider such as local-fetch may not be registered
+        # yet, so _is_backend_available(specific) returns False and extraction
+        # incorrectly falls back to ddgs/search snippets.
+        try:
+            _ensure_web_plugins_loaded()
+        except NameError:
+            pass
     if specific and _is_backend_available(specific):
         return specific
     return _get_backend()

@@ -1218,7 +1218,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
 
         # Adapter-level allow_from / group_allow_from: when set, they are the
-        # sole authority.  Group chats use group_allow_from; DMs use allow_from.
+        # sole authority. Group chats use group_allow_from; DMs use allow_from.
+        # Accept both numeric IDs and public @username forms so a pre-seeded
+        # allowlist works before the bot has observed the numeric user ID.
         chat_type = source.chat_type or ""
         if chat_type in ("group", "forum", "channel"):
             adapter_allow_from = self.config.extra.get("group_allow_from")
@@ -1226,7 +1228,16 @@ class TelegramAdapter(BasePlatformAdapter):
             adapter_allow_from = self.config.extra.get("allow_from")
         if adapter_allow_from is not None:
             allowed = _coerce_allow_set(adapter_allow_from)
-            return user_id in allowed or "*" in allowed
+            allowed_lower = {value.lower() for value in allowed}
+            candidates = {user_id, user_id.lower()}
+            if source.user_name:
+                uname = str(source.user_name).strip()
+                if uname:
+                    bare = uname.lstrip("@")
+                    candidates.update({uname, uname.lower()})
+                    if bare:
+                        candidates.update({bare, bare.lower(), f"@{bare}", f"@{bare.lower()}"})
+            return "*" in allowed or bool(candidates & allowed) or bool(candidates & allowed_lower)
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
@@ -1268,7 +1279,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if not allowed_csv:
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-        return "*" in allowed_ids or user_id in allowed_ids
+        allowed_lower = {uid.lower() for uid in allowed_ids}
+        candidates = {user_id}
+        if source.user_name:
+            uname = str(source.user_name).strip()
+            if uname:
+                candidates.update({uname, uname.lower()})
+                bare = uname.lstrip("@")
+                if bare:
+                    candidates.update({bare, bare.lower(), f"@{bare}", f"@{bare.lower()}"})
+        return "*" in allowed_ids or bool(candidates & allowed_ids) or bool(candidates & allowed_lower)
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:

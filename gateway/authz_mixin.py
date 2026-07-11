@@ -679,6 +679,19 @@ class GatewayAuthorizationMixin:
         if "@" in user_id:
             check_ids.add(user_id.split("@")[0])
 
+        # Telegram: support public @username entries in allowlists for cases
+        # where an operator needs to pre-seed access before the bot has seen
+        # the numeric Telegram user_id. Numeric IDs remain preferred because
+        # usernames can be renamed/reassigned.
+        if source.platform == Platform.TELEGRAM and source.user_name:
+            uname = str(source.user_name).strip()
+            if uname:
+                check_ids.update({uname, uname.lower()})
+                bare = uname.lstrip("@")
+                if bare:
+                    check_ids.update({bare, bare.lower(), f"@{bare}", f"@{bare.lower()}"})
+                allowed_ids.update({uid.lower() for uid in list(allowed_ids)})
+
         # WhatsApp: resolve phone↔LID aliases from bridge session mapping files
         if source.platform == Platform.WHATSAPP:
             normalized_allowed_ids = set()

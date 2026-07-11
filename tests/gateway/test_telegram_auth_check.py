@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
+from gateway.session import SessionSource
 
 
 def _make_adapter(allow_from=None, allowed_chats=None, group_allowed_chats=None, callback_auth=None, **extra_overrides):
@@ -47,7 +49,14 @@ def _make_adapter(allow_from=None, allowed_chats=None, group_allowed_chats=None,
     return adapter
 
 
-def _make_message(text="hello", *, from_user_id=111, chat_id=-100, chat_type="group"):
+def _make_message(
+    text="hello",
+    *,
+    from_user_id=111,
+    username="testuser",
+    chat_id=-100,
+    chat_type="group",
+):
     return SimpleNamespace(
         message_id=42,
         text=text,
@@ -57,7 +66,12 @@ def _make_message(text="hello", *, from_user_id=111, chat_id=-100, chat_type="gr
         message_thread_id=None,
         is_topic_message=False,
         chat=SimpleNamespace(id=chat_id, type=chat_type, title="Test", is_forum=False),
-        from_user=SimpleNamespace(id=from_user_id, full_name="Test User", first_name="Test"),
+        from_user=SimpleNamespace(
+            id=from_user_id,
+            username=username,
+            full_name="Test User",
+            first_name="Test",
+        ),
         reply_to_message=None,
         date=None,
         location=None,
@@ -405,3 +419,43 @@ async def test_unmentioned_group_location_from_removed_user_not_observed():
     await adapter._handle_location_message(update, SimpleNamespace())
 
     assert observed == []
+
+
+def test_adapter_allow_from_accepts_public_username_case_insensitively():
+    adapter = _make_adapter(allow_from=["@Alice"])
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=111, username="alice")
+    ) is True
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=111, username="mallory")
+    ) is False
+
+
+def test_adapter_env_allowlist_accepts_public_username(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "@Alice")
+    adapter = _make_adapter()
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=111, username="Alice")
+    ) is True
+
+
+def test_gateway_allowlist_accepts_telegram_public_username(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "@Alice")
+
+    class AuthHarness(GatewayAuthorizationMixin):
+        adapters = {}
+        pairing_store = None
+        pairing_stores = {}
+
+    runner = AuthHarness()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="111",
+        chat_type="dm",
+        user_id="999",
+        user_name="Alice",
+    )
+
+    assert runner._is_user_authorized(source) is True
