@@ -47,6 +47,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from plugins.platforms.telegram.adapter import TelegramAdapter
+import plugins.platforms.telegram.adapter as telegram_adapter
 from gateway.config import Platform, PlatformConfig
 
 
@@ -256,7 +257,7 @@ class TestTelegramExecApproval:
         )
 
         assert result.success is True
-        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        assert sent["parse_mode"] is telegram_adapter.ParseMode.MARKDOWN_V2
         assert "Fix \\[issue\\]\\_1" in sent["text"]
         assert "alpha\\_beta" in sent["text"]
 
@@ -431,7 +432,7 @@ class TestTelegramApprovalCallback:
                 await adapter._handle_callback_query(update, context)
 
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        assert edit_kwargs["parse_mode"] is telegram_adapter.ParseMode.MARKDOWN_V2
         assert "Alice\\_Bob" in edit_kwargs["text"]
         assert "Approved once" in edit_kwargs["text"]
 

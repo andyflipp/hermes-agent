@@ -144,7 +144,11 @@ class TestFindSessionId:
             }
         })
 
-        with patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+        # This case exercises the legacy JSON fallback specifically. Keep a
+        # session created by an earlier test in state.db from pre-empting the
+        # fixture and making the result order-dependent.
+        with patch("hermes_state.SessionDB", side_effect=RuntimeError("force JSON fallback")), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
             result = _find_session_id("telegram", "123")
 
         assert result == "sess_1"

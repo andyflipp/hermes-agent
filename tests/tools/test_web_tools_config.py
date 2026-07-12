@@ -609,7 +609,9 @@ class TestCheckWebApiKey:
 
     def test_no_keys_returns_false(self):
         from tools.web_tools import check_web_api_key
-        with patch("tools.web_tools._ddgs_package_importable", return_value=False):
+        with patch("tools.web_tools._ddgs_package_importable", return_value=False), \
+             patch("agent.web_search_registry.get_active_search_provider", return_value=None), \
+             patch("agent.web_search_registry.get_active_extract_provider", return_value=None):
             assert check_web_api_key() is False
 
     def test_both_keys_returns_true(self):
@@ -676,7 +678,10 @@ class TestCheckWebApiKey:
     def test_configured_backend_must_match_available_provider(self):
         with patch("tools.web_tools._load_web_config", return_value={"backend": "parallel"}):
             with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
-                with patch.dict(os.environ, {"FIRECRAWL_GATEWAY_URL": "http://127.0.0.1:3002"}, clear=False):
+                with patch("tools.web_tools._ddgs_package_importable", return_value=False), \
+                     patch("agent.web_search_registry.get_active_search_provider", return_value=None), \
+                     patch("agent.web_search_registry.get_active_extract_provider", return_value=None), \
+                     patch.dict(os.environ, {"FIRECRAWL_GATEWAY_URL": "http://127.0.0.1:3002"}, clear=False):
                     from tools.web_tools import check_web_api_key
                     assert check_web_api_key() is False
 
