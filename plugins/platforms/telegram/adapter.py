@@ -1224,6 +1224,8 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_type = source.chat_type or ""
         if chat_type in ("group", "forum", "channel"):
             adapter_allow_from = self.config.extra.get("group_allow_from")
+            if adapter_allow_from is None:
+                adapter_allow_from = self.config.extra.get("allow_from")
         else:
             adapter_allow_from = self.config.extra.get("allow_from")
         if adapter_allow_from is not None:
