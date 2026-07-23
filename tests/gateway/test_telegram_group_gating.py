@@ -12,7 +12,6 @@ def _make_adapter(
     require_mention=None,
     free_response_chats=None,
     free_response_topics=None,
-    free_response_senders=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -34,8 +33,6 @@ def _make_adapter(
         extra["free_response_chats"] = free_response_chats
     if free_response_topics is not None:
         extra["free_response_topics"] = free_response_topics
-    if free_response_senders is not None:
-        extra["free_response_senders"] = free_response_senders
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -551,23 +548,6 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
-def test_free_response_senders_bypass_mention_requirement_only_in_scoped_chat():
-    adapter = _make_adapter(
-        require_mention=True,
-        free_response_senders=["-200:@Vitaliy234567"],
-    )
-    vitaliy = _group_message("hello everyone", chat_id=-200)
-    vitaliy.from_user.username = "Vitaliy234567"
-    same_user_other_chat = _group_message("hello everyone", chat_id=-201)
-    same_user_other_chat.from_user.username = "Vitaliy234567"
-    other_user = _group_message("hello everyone", chat_id=-200)
-    other_user.from_user.username = "someone_else"
-
-    assert adapter._should_process_message(vitaliy) is True
-    assert adapter._should_process_message(same_user_other_chat) is False
-    assert adapter._should_process_message(other_user) is False
-
-
 def test_free_response_topics_bypass_mention_requirement_only_for_topic():
     adapter = _make_adapter(require_mention=True, free_response_topics=["-200:31"])
 
@@ -825,8 +805,6 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "    - \"^\\\\s*chompy\\\\b\"\n"
         "  free_response_chats:\n"
         "    - \"-123\"\n"
-        "  free_response_senders:\n"
-        "    - \"-123:@Vitaliy234567\"\n"
         "  allowed_chats:\n"
         "    - \"-100\"\n"
         "  group_allowed_chats:\n"
@@ -849,7 +827,6 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "TELEGRAM_GUEST_MODE",
         "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES",
         "TELEGRAM_FREE_RESPONSE_CHATS",
-        "TELEGRAM_FREE_RESPONSE_SENDERS",
         "TELEGRAM_ALLOWED_CHATS",
         "TELEGRAM_GROUP_ALLOWED_CHATS",
         "TELEGRAM_ALLOWED_TOPICS",
@@ -880,10 +857,6 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     # TELEGRAM_FREE_RESPONSE_CHATS is not a key that appears in developer .env
     # files, so asserting it via os.environ stays deterministic.
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
-    assert (
-        __import__("os").environ["TELEGRAM_FREE_RESPONSE_SENDERS"]
-        == "-123:@Vitaliy234567"
-    )
 
 
 def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):
