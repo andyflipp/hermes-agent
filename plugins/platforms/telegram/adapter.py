@@ -7620,6 +7620,34 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_senders(self) -> set[str]:
+        """Return scoped ``<chat_id>:<user_id|@username>`` mention bypasses."""
+        raw = self.config.extra.get("free_response_senders")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_FREE_RESPONSE_SENDERS", "")
+        if isinstance(raw, list):
+            parts = raw
+        else:
+            parts = str(raw).split(",")
+        return {str(part).strip().lower() for part in parts if str(part).strip()}
+
+    def _telegram_is_free_response_sender(self, message) -> bool:
+        allowed = self._telegram_free_response_senders()
+        if not allowed:
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        sender = getattr(message, "from_user", None)
+        if not chat_id or sender is None:
+            return False
+        candidates = set()
+        user_id = getattr(sender, "id", None)
+        if user_id is not None:
+            candidates.add(f"{chat_id}:{user_id}".lower())
+        username = str(getattr(sender, "username", "") or "").lstrip("@").lower()
+        if username:
+            candidates.add(f"{chat_id}:@{username}".lower())
+        return bool(candidates & allowed)
+
     def _telegram_free_response_topics(self) -> set[str]:
         """Return topic-level free-response allowlist entries as ``<chat_id>:<thread_id>``.
 
@@ -8383,6 +8411,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if chat_id_str in self._telegram_free_response_chats():
             return True
         if self._telegram_is_free_response_topic(message):
+            return True
+        if self._telegram_is_free_response_sender(message):
             return True
         if not self._telegram_require_mention():
             return True
@@ -9947,6 +9977,12 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
         os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+    frs = telegram_cfg.get("free_response_senders")
+    if frs is not None:
+        extras.setdefault("free_response_senders", frs)
+        if not os.getenv("TELEGRAM_FREE_RESPONSE_SENDERS"):
+            env_frs = ",".join(str(v) for v in frs) if isinstance(frs, list) else str(frs)
+            os.environ["TELEGRAM_FREE_RESPONSE_SENDERS"] = env_frs
     frt = telegram_cfg.get("free_response_topics")
     if frt is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS"):
         if isinstance(frt, list):
