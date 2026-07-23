@@ -159,6 +159,35 @@ def test_group_messages_can_be_opened_via_config():
     assert adapter._should_process_message(_group_message("hello everyone")) is True
 
 
+def test_explicit_group_mention_is_marked_addressed_after_trigger_cleanup():
+    adapter = _make_adapter(require_mention=True)
+    text = "@hermes_bot prepare the stack"
+    msg = _group_message(text, entities=[_mention_entity(text)])
+
+    assert adapter._should_process_message(msg) is True
+    event = adapter._build_message_event(msg, MessageType.TEXT, update_id=1000)
+    cleaned_text = adapter._clean_bot_trigger_text(event.text or "")
+
+    assert cleaned_text == "prepare the stack"
+    prompt = event.channel_prompt or ""
+    assert "already passed the Telegram trigger gate" in prompt
+    assert "must be treated as addressed to you" in prompt
+    assert "Do not return NO_REPLY" in prompt
+
+
+def test_reply_to_bot_is_marked_addressed_even_without_visible_mention():
+    adapter = _make_adapter(require_mention=True)
+    msg = _group_message("continue", reply_to_bot=True)
+
+    assert adapter._should_process_message(msg) is True
+    event = adapter._build_message_event(msg, MessageType.TEXT, update_id=1000)
+
+    assert event.text == "continue"
+    prompt = event.channel_prompt or ""
+    assert "already passed the Telegram trigger gate" in prompt
+    assert "must be treated as addressed to you" in prompt
+
+
 def test_unmentioned_group_messages_can_be_observed_without_dispatching():
     async def _run():
         adapter = _make_adapter(

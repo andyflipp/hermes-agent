@@ -8394,6 +8394,40 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(message)
 
+    def _explicit_group_trigger_prompt(self, message: Any) -> Optional[str]:
+        """Tell the agent that Telegram already proved this is an addressed turn.
+
+        The adapter removes ``@botname`` before dispatch so users do not leak a
+        transport-level wake word into the conversation.  Without a durable
+        marker, downstream instructions can inspect the cleaned text, conclude
+        that no mention is present, and incorrectly emit ``NO_REPLY`` even
+        though this exact update passed the mention/reply gate.
+
+        Free-response groups intentionally receive no marker: normal noise
+        filtering remains available there.
+        """
+        if not self._is_group_chat(message):
+            return None
+
+        reason: Optional[str] = None
+        if self._is_reply_to_bot(message):
+            reason = "a Telegram Reply to this bot"
+        elif self._message_mentions_bot(message):
+            reason = "an explicit @mention of this bot"
+        elif self._message_matches_mention_patterns(message):
+            reason = "a configured explicit wake pattern"
+
+        if reason is None:
+            return None
+
+        return (
+            "This current group message already passed the Telegram trigger gate "
+            f"because it contained {reason}. The visible trigger may have been "
+            "removed from the cleaned message text. This turn must be treated as "
+            "addressed to you and answered substantively. Do not return NO_REPLY "
+            "merely because the cleaned text no longer contains @botname."
+        )
+
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.
 
@@ -9705,6 +9739,11 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id_str or _chat_id_str,
             _chat_id_str if thread_id_str else None,
         )
+        _explicit_trigger_prompt = self._explicit_group_trigger_prompt(message)
+        if _explicit_trigger_prompt:
+            _channel_prompt = "\n\n".join(
+                part for part in (_channel_prompt, _explicit_trigger_prompt) if part
+            )
 
         return MessageEvent(
             text=self._render_text_with_hidden_entity_links(
