@@ -126,8 +126,11 @@ platforms:
 - Hermes disables typing, streaming, and interim previews for these commands.
   If Telegram rejects private delivery, Hermes does not resend the content
   publicly. Telegram allows the inbound ephemeral reply anchor for 15 seconds;
-  Hermes uses a 14-second local guard for transport headroom, then attempts an
-  administrator-only private send without the expired anchor.
+  Hermes uses a 14-second local guard for transport headroom and re-evaluates
+  it immediately before each chunk and Markdown fallback, then attempts an
+  administrator-only private send without the expired anchor. Recipient,
+  anchor, and monotonic timing fields stay only in wire-invisible delivery
+  metadata, not plugin-visible event metadata or durable session identity.
 - Keep interactive commands that edit inline keyboards out of the list unless
   their callback flow supports ephemeral edits.
 - **Rich inline media** upgrades a final rich report containing local `MEDIA:`

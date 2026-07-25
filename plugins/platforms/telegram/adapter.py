@@ -1913,8 +1913,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     await asyncio.sleep(
                         getattr(self, "_text_batch_split_delay_seconds", 0.0)
                     )
-                notification_kwargs = self._notification_kwargs(metadata)
-                notification_kwargs.pop("api_kwargs", None)
+                    private_kwargs = self._ephemeral_send_api_kwargs(metadata)
+                    if private_kwargs is None:
+                        raise ValueError(
+                            "Ephemeral delivery refused: receiver_user_id is missing"
+                        )
+                # This raw Bot API path owns the private target fields above.
+                # Build notification flags directly so _notification_kwargs()
+                # cannot calculate a second, immediately-discarded anchor.
+                notification_kwargs: Dict[str, Any] = {}
+                if (
+                    getattr(self, "_notifications_mode", "important") == "important"
+                    and not (metadata or {}).get("notify")
+                ):
+                    notification_kwargs["disable_notification"] = True
                 payload: Dict[str, Any] = {
                     "chat_id": normalize_telegram_chat_id(chat_id),
                     "text": chunk,
@@ -1933,7 +1945,15 @@ class TelegramAdapter(BasePlatformAdapter):
                         for marker in ("parse", "markdown", "entity")
                     ):
                         raise
+                    fallback_private_kwargs = self._ephemeral_send_api_kwargs(metadata)
+                    if fallback_private_kwargs is None:
+                        raise ValueError(
+                            "Ephemeral delivery refused: receiver_user_id is missing"
+                        )
                     plain_payload = dict(payload)
+                    plain_payload.pop("receiver_user_id", None)
+                    plain_payload.pop("reply_parameters", None)
+                    plain_payload.update(fallback_private_kwargs)
                     plain_payload["text"] = _strip_mdv2(chunk)
                     plain_payload.pop("parse_mode", None)
                     await self._bot.do_api_request(
@@ -10241,9 +10261,9 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         ephemeral_metadata = self._ephemeral_metadata_for_message(message)
         event_metadata = self._community_metadata_for_message(message)
-        event_metadata.update(ephemeral_metadata)
         # Delivery metadata is deliberately separate from SessionSource's
-        # identity fields and is forwarded by the generic gateway send paths.
+        # identity and plugin-visible event metadata. It is forwarded only by
+        # the generic gateway send paths and excluded from session wire data.
         source.delivery_metadata = ephemeral_metadata
         
         # Extract reply context if this message is a reply.

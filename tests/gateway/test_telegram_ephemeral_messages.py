@@ -130,7 +130,10 @@ def test_build_message_event_preserves_private_delivery_context():
 
     event = adapter._build_message_event(message, MessageType.TEXT)
 
-    assert event.metadata["telegram_ephemeral_required"] is True
+    assert "telegram_ephemeral_required" not in event.metadata
+    assert "telegram_ephemeral_receiver_user_id" not in event.metadata
+    assert "telegram_ephemeral_message_id" not in event.metadata
+    assert "telegram_ephemeral_received_at_monotonic" not in event.metadata
     assert event.source.delivery_metadata["telegram_ephemeral_receiver_user_id"] == 42
     assert event.source.delivery_metadata["telegram_ephemeral_message_id"] == "in-eph-1"
 
@@ -247,6 +250,42 @@ async def test_ephemeral_text_reply_uses_botapi_10_2_fields_and_not_public_send(
 
 
 @pytest.mark.asyncio
+async def test_ephemeral_text_recomputes_reply_anchor_before_later_chunks():
+    adapter = _adapter()
+    adapter.truncate_message = MagicMock(return_value=["first", "second"])
+    metadata = {
+        "telegram_ephemeral_required": True,
+        "telegram_ephemeral_receiver_user_id": 42,
+        "telegram_ephemeral_message_id": "in-eph-1",
+        "telegram_ephemeral_received_at_monotonic": 100.0,
+    }
+
+    with patch.object(
+        adapter,
+        "_ephemeral_send_api_kwargs",
+        side_effect=[
+            {
+                "receiver_user_id": 42,
+                "reply_parameters": {"ephemeral_message_id": "in-eph-1"},
+            },
+            {"receiver_user_id": 42},
+        ],
+    ) as private_kwargs_builder:
+        result = await adapter._send_ephemeral_text("-100123", "long", metadata)
+
+    assert result.success is True
+    assert private_kwargs_builder.call_count == 2
+    first_payload = adapter._bot.do_api_request.await_args_list[0].kwargs["api_kwargs"]
+    second_payload = adapter._bot.do_api_request.await_args_list[1].kwargs["api_kwargs"]
+    assert first_payload["receiver_user_id"] == 42
+    assert first_payload["reply_parameters"] == {
+        "ephemeral_message_id": "in-eph-1"
+    }
+    assert second_payload["receiver_user_id"] == 42
+    assert "reply_parameters" not in second_payload
+
+
+@pytest.mark.asyncio
 async def test_ephemeral_text_preserves_forum_thread_target():
     adapter = _adapter()
     metadata = {
@@ -316,6 +355,45 @@ async def test_ephemeral_markdown_fallback_remains_private():
     retry_payload = adapter._bot.do_api_request.await_args_list[1].kwargs["api_kwargs"]
     assert retry_payload["receiver_user_id"] == 42
     assert retry_payload["reply_parameters"] == {"ephemeral_message_id": "in-eph-1"}
+    assert "parse_mode" not in retry_payload
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_markdown_fallback_recomputes_reply_anchor():
+    adapter = _adapter()
+    adapter._bot.do_api_request = AsyncMock(
+        side_effect=[BadRequest("can't parse entities"), {"message_id": 0}]
+    )
+    metadata = {
+        "telegram_ephemeral_required": True,
+        "telegram_ephemeral_receiver_user_id": 42,
+        "telegram_ephemeral_message_id": "in-eph-1",
+        "telegram_ephemeral_received_at_monotonic": 100.0,
+    }
+
+    with patch.object(
+        adapter,
+        "_ephemeral_send_api_kwargs",
+        side_effect=[
+            {
+                "receiver_user_id": 42,
+                "reply_parameters": {"ephemeral_message_id": "in-eph-1"},
+            },
+            {"receiver_user_id": 42},
+        ],
+    ) as private_kwargs_builder:
+        result = await adapter._send_ephemeral_text(
+            "-100123", "broken _ markdown", metadata
+        )
+
+    assert result.success is True
+    assert private_kwargs_builder.call_count == 2
+    first_payload = adapter._bot.do_api_request.await_args_list[0].kwargs["api_kwargs"]
+    retry_payload = adapter._bot.do_api_request.await_args_list[1].kwargs["api_kwargs"]
+    assert "reply_parameters" in first_payload
+    assert retry_payload["receiver_user_id"] == 42
+    assert "reply_parameters" not in retry_payload
     assert "parse_mode" not in retry_payload
     adapter._bot.send_message.assert_not_called()
 
