@@ -88,6 +88,35 @@ class TestCodingContextBlock:
         assert "coding agent" in stable
         assert "Workspace" in stable
 
+    def test_configured_and_posture_skill_compaction_are_merged(self):
+        captured = {}
+
+        def fake_skills_prompt(**kwargs):
+            captured.update(kwargs)
+            return ""
+
+        agent = _make_agent(valid_tool_names=["skill_view"], platform="telegram")
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.build_skills_system_prompt", side_effect=fake_skills_prompt),
+            patch(
+                "agent.coding_context.coding_compact_skill_categories",
+                return_value=frozenset({"coding-only"}),
+            ),
+            patch(
+                "agent.coding_context.configured_compact_skill_categories",
+                return_value=frozenset({"creative"}),
+            ),
+        ):
+            build_system_prompt_parts(agent)
+
+        assert captured["compact_categories"] == frozenset(
+            {"coding-only", "creative"}
+        )
+
     def test_absent_when_off(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))

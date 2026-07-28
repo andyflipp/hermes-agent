@@ -513,6 +513,24 @@ class TestProfiles:
         general = cc.resolve_runtime_mode(platform="telegram", cwd=tmp_path, config={})
         assert general.compact_skill_categories() == frozenset()
 
+    def test_configured_skill_compaction_merges_global_and_platform_categories(self):
+        cfg = {
+            "skills": {
+                "compact_categories": ["creative", " Media ", ""],
+                "platform_compact_categories": {
+                    "telegram": ["gaming", "CREATIVE"],
+                    "webui": ["email"],
+                },
+            }
+        }
+
+        compact = cc.configured_compact_skill_categories(
+            platform="telegram", config=cfg
+        )
+
+        assert compact == frozenset({"creative", "media", "gaming"})
+        assert "email" not in compact
+
 
 # ── detection signals ───────────────────────────────────────────────────────
 

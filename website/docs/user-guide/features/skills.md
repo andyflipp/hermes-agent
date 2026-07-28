@@ -139,6 +139,33 @@ Level 2: skill_view(name, path)  → Specific reference file       (varies)
 
 The agent only loads the full skill content when it actually needs it.
 
+### Compacting large skill indexes without hiding skills
+
+Profiles with many installed skills can keep every skill discoverable while
+omitting descriptions for selected categories from the stable system prompt.
+Configure a global category deny-list, a per-platform deny-list, or both:
+
+```yaml
+skills:
+  compact_categories:
+    - gaming
+    - smart-home
+  platform_compact_categories:
+    telegram:
+      - creative
+      - media
+```
+
+A compacted category appears as one `[names only]` line. Every skill name stays
+visible, slash commands still work, and `skills_list` / `skill_view` still
+return the normal metadata and full content. Only the per-skill descriptions
+are omitted from the stable prompt index. Category matching uses the top-level
+path segment, so `social-media` also compacts `social-media/twitter`.
+
+The setting is resolved while a session's stable prompt is built. Existing
+conversations keep their cached prompt; start a new session (or restart a
+messaging gateway before the next conversation) to apply a changed policy.
+
 ## SKILL.md Format
 
 ```markdown

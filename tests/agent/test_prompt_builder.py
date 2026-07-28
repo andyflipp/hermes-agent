@@ -461,8 +461,11 @@ class TestBuildSkillsSystemPrompt:
         assert "tweet-stuff" in result
         assert "Does tweet-stuff things" not in result
         assert "social-media [names only]" in result
-        # Disclosure note explains the demotion and how to load.
+        # Disclosure note explains the demotion and how to load, without
+        # incorrectly claiming that every names-only policy is a coding posture.
         assert "skill_view" in result
+        assert "active context policy" in result
+        assert "current coding context" not in result
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path

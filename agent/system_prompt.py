@@ -306,10 +306,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # default coding posture leaves the index untouched.
         _compact_cats = frozenset()
         try:
-            from agent.coding_context import coding_compact_skill_categories
+            from agent.coding_context import (
+                coding_compact_skill_categories,
+                configured_compact_skill_categories,
+            )
 
-            _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
+            _compact_cats = (
+                coding_compact_skill_categories(
+                    platform=agent.platform, cwd=resolve_context_cwd()
+                )
+                | configured_compact_skill_categories(platform=agent.platform)
             )
         except Exception:
             _compact_cats = frozenset()

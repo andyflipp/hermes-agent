@@ -663,6 +663,50 @@ def coding_compact_skill_categories(
     ).compact_skill_categories()
 
 
+def configured_compact_skill_categories(
+    *,
+    platform: Optional[str] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> frozenset[str]:
+    """Names-only skill categories configured for the stable prompt index.
+
+    ``skills.compact_categories`` applies on every platform, while
+    ``skills.platform_compact_categories.<platform>`` adds a platform-specific
+    deny-list. Categories are demoted, never hidden: the skill names and the
+    ``skill_view``/``skills_list`` capability remain available.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+
+    skills_cfg = (config or {}).get("skills", {}) or {}
+    if not isinstance(skills_cfg, dict):
+        return frozenset()
+
+    raw_values: list[Any] = []
+    global_values = skills_cfg.get("compact_categories", [])
+    if isinstance(global_values, (list, tuple, set, frozenset)):
+        raw_values.extend(global_values)
+
+    platform_map = skills_cfg.get("platform_compact_categories", {}) or {}
+    if isinstance(platform_map, dict):
+        platform_values = platform_map.get(str(platform or "").strip().lower(), [])
+        if isinstance(platform_values, (list, tuple, set, frozenset)):
+            raw_values.extend(platform_values)
+
+    return frozenset(
+        normalized
+        for value in raw_values
+        if isinstance(value, str)
+        for normalized in [value.strip().lower()]
+        if normalized
+    )
+
+
 def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
     """Names of MCP servers the user has enabled — kept in the coding posture.
 
