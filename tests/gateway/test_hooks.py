@@ -3,8 +3,9 @@
 from unittest.mock import patch
 
 import pytest
+from types import SimpleNamespace
 
-from gateway.hooks import HookRegistry
+from gateway.hooks import HookRegistry, resolve_ingress_hook_decision
 
 
 def _create_hook(hooks_dir, hook_name, events, handler_code):
@@ -25,6 +26,67 @@ class TestHookRegistryInit:
         reg = HookRegistry()
         assert reg.loaded_hooks == []
         assert reg._handlers == {}
+
+
+class TestIngressDecision:
+    def test_ignores_unhandled_and_unknown_shapes(self):
+        assert resolve_ingress_hook_decision([
+            None,
+            {"handled": False, "response": "no"},
+            {"handled": True, "response": "x", "extra": True},
+            {"handled": True, "response": ""},
+        ]) is None
+
+    def test_accepts_one_strict_handled_response(self):
+        assert resolve_ingress_hook_decision([
+            {"handled": True, "response": "  accepted  "},
+        ]) == "accepted"
+
+    def test_multiple_claims_fail_closed(self):
+        response = resolve_ingress_hook_decision([
+            {"handled": True, "response": "one"},
+            {"handled": True, "response": "two"},
+        ])
+        assert response is not None
+        assert "остановлена" in response
+
+    @pytest.mark.asyncio
+    async def test_handled_message_returns_before_session_or_raw_id_logging(self, caplog):
+        from gateway.run import GatewayRunner
+        from gateway.session import Platform
+
+        class Hooks:
+            async def emit_collect(self, event_type, context):
+                assert event_type == "ingress:message"
+                assert context["media_urls"] == ["/private/cached.pdf"]
+                return [{"handled": True, "response": "draft result"}]
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        object.__setattr__(runner, "hooks", Hooks())
+        source = SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            user_id="raw-user-123",
+            chat_id="raw-chat-456",
+            thread_id="raw-thread-789",
+            chat_type="dm",
+        )
+        event = SimpleNamespace(
+            text="",
+            message_id="raw-message-321",
+            message_type=SimpleNamespace(value="document"),
+            media_urls=["/private/cached.pdf"],
+            media_types=["application/pdf"],
+        )
+
+        result = await runner._handle_message_with_agent(event, source, "key", 1)
+
+        assert result == "draft result"
+        assert event._ingress_hook_handled is True
+        logs = caplog.text
+        assert "raw-user-123" not in logs
+        assert "raw-chat-456" not in logs
+        assert "raw-thread-789" not in logs
+        assert "/private/cached.pdf" not in logs
 
 
 def _patch_no_builtins(reg):
