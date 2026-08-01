@@ -12355,7 +12355,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _maybe_results = _emit_collect("ingress:message", _ingress_context)
                 if inspect.isawaitable(_maybe_results):
                     _maybe_results = await _maybe_results
-                if isinstance(_maybe_results, list):
+                if type(_maybe_results) is list:
                     _ingress_results = _maybe_results
                 else:
                     # A decision dispatcher returning a malformed container is

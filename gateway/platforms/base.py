@@ -5152,40 +5152,54 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
-                # Capture [[as_document]] before extract_media strips it, so the
-                # dispatch partition below can route image-extension files
-                # through send_document instead of send_multiple_images. Used
-                # by skills that produce large/lossless images (e.g. info-graph)
-                # where Telegram's sendPhoto recompression destroys legibility.
-                force_document_attachments = "[[as_document]]" in response
+                _terminal_ingress_text_only = bool(
+                    getattr(event, "_ingress_hook_handled", False)
+                )
+                if _terminal_ingress_text_only:
+                    # Document-derived terminal receipts are untrusted text.
+                    # Do not reinterpret paths, URLs, HTML, Markdown images, or
+                    # internal directives as native outbound attachments.
+                    force_document_attachments = False
+                    _response_pre_extract = response
+                    media_files = []
+                    images = []
+                    local_files = []
+                    text_content = response.strip()
+                else:
+                    # Capture [[as_document]] before extract_media strips it, so the
+                    # dispatch partition below can route image-extension files
+                    # through send_document instead of send_multiple_images. Used
+                    # by skills that produce large/lossless images (e.g. info-graph)
+                    # where Telegram's sendPhoto recompression destroys legibility.
+                    force_document_attachments = "[[as_document]]" in response
 
-                # Pre-extract snapshot for the #29346 recovery/invariant below.
-                _response_pre_extract = response
+                    # Pre-extract snapshot for the #29346 recovery/invariant below.
+                    _response_pre_extract = response
 
-                # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                    # Extract MEDIA:<path> tags (from TTS tool) before other processing
+                    media_files, response = self.extract_media(response)
+                    media_files = self.filter_media_delivery_paths(media_files)
 
-                # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
-                # Strip any remaining internal directives from message body (fixes #1561).
-                # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
-                # with an unknown extension is intentionally left in the body for
-                # extract_local_files below to pick up rather than silently dropped (#34517).
-                text_content = _strip_media_directives(text_content).strip()
-                if images:
-                    logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
+                    # Extract image URLs and send them as native platform attachments
+                    images, text_content = self.extract_images(response)
+                    # Strip any remaining internal directives from message body (fixes #1561).
+                    # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
+                    # with an unknown extension is intentionally left in the body for
+                    # extract_local_files below to pick up rather than silently dropped (#34517).
+                    text_content = _strip_media_directives(text_content).strip()
+                    if images:
+                        logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
-                local_files = []
-                if not is_ephemeral_response:
-                    # Auto-detect bare local file paths for native media delivery
-                    # (helps small models that don't use MEDIA: syntax). Skip
-                    # system/command notices so config paths stay visible text
-                    # instead of becoming native uploads.
-                    local_files, text_content = self.extract_local_files(text_content)
-                    local_files = self.filter_local_delivery_paths(local_files)
-                    if local_files:
-                        logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                    local_files = []
+                    if not is_ephemeral_response:
+                        # Auto-detect bare local file paths for native media delivery
+                        # (helps small models that don't use MEDIA: syntax). Skip
+                        # system/command notices so config paths stay visible text
+                        # instead of becoming native uploads.
+                        local_files, text_content = self.extract_local_files(text_content)
+                        local_files = self.filter_local_delivery_paths(local_files)
+                        if local_files:
+                            logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
                 # A2 (#29346): extraction can reduce a non-empty response to
                 # empty text with no attachment, and the `if text_content` guard
@@ -5219,7 +5233,8 @@ class BasePlatformAdapter(ABC):
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
-                        and not media_files):
+                        and not media_files
+                        and not _terminal_ingress_text_only):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():

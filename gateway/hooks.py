@@ -87,10 +87,20 @@ def resolve_ingress_hook_decision(results: List[Any]) -> Optional[str]:
     message, malformed output and multiple claims fail closed rather than
     falling through to an LLM or choosing an order-dependent winner.
     """
+    if type(results) is not list:
+        return _INGRESS_FAILURE_RESPONSE
+
     decisions: List[str] = []
     malformed_claim = False
     for result in results:
-        if not isinstance(result, dict) or result.get("handled") is not True:
+        if not isinstance(result, dict):
+            continue
+        # A hostile dict subclass can make get()/iteration raise or lie. Hook
+        # decisions cross a security boundary, so accept only a plain mapping.
+        if type(result) is not dict:
+            malformed_claim = True
+            continue
+        if result.get("handled") is not True:
             continue
         if set(result) == {"handled", "response"}:
             response = result.get("response")

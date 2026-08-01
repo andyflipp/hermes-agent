@@ -1,7 +1,7 @@
 """Tests for gateway/hooks.py — event hook system."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -112,6 +112,27 @@ class TestIngressDecision:
         assert response is not None
         assert "остановлена" in response
 
+    def test_hostile_mapping_subclass_fails_closed(self):
+        class HostileDict(dict):
+            def get(self, *_args, **_kwargs):
+                raise RuntimeError("must not execute hostile mapping methods")
+
+            def __iter__(self):
+                raise RuntimeError("must not iterate hostile mapping")
+
+        response = resolve_ingress_hook_decision([HostileDict(handled=True)])
+        assert response is not None
+        assert "остановлена" in response
+
+    def test_hostile_results_container_fails_closed(self):
+        class HostileList(list):
+            def __iter__(self):
+                raise RuntimeError("must not iterate hostile result container")
+
+        response = resolve_ingress_hook_decision(HostileList())
+        assert response is not None
+        assert "остановлена" in response
+
     @pytest.mark.asyncio
     async def test_handled_message_returns_before_session_or_raw_id_logging(self, caplog):
         from gateway.run import GatewayRunner
@@ -197,6 +218,77 @@ class TestIngressDecision:
         assert "raw-user-terminal" not in caplog.text
         assert "raw-chat-terminal" not in caplog.text
         assert "raw-message-terminal" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_terminal_response_delivery_stays_text_only(self, tmp_path):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            MessageEvent,
+            MessageType,
+            SendResult,
+        )
+        from gateway.session import SessionSource, build_session_key
+
+        class TextAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(
+                    PlatformConfig(enabled=True, token="test"),
+                    Platform.TELEGRAM,
+                )
+
+            async def connect(self, *, is_reconnect: bool = False):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                return SendResult(success=True, message_id="text")
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id, "type": "dm"}
+
+        local_file = tmp_path / "receipt.txt"
+        local_file.write_text("private", encoding="utf-8")
+        response = (
+            f"Receipt path: {local_file}\n"
+            "![remote](https://attacker.invalid/image.png)\n"
+            '<img src="https://attacker.invalid/no-extension">'
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+            thread_id="48380",
+        )
+        event = MessageEvent(
+            text="document",
+            message_type=MessageType.DOCUMENT,
+            source=source,
+            message_id="msg-1",
+        )
+        setattr(event, "_ingress_hook_handled", True)
+        adapter = TextAdapter()
+        adapter._message_handler = AsyncMock(return_value=response)
+        adapter.extract_media = MagicMock(side_effect=AssertionError("media parser called"))
+        adapter.extract_images = MagicMock(side_effect=AssertionError("image parser called"))
+        adapter.extract_local_files = MagicMock(side_effect=AssertionError("path parser called"))
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="text"))
+        adapter.send_multiple_images = AsyncMock()
+        adapter.send_document = AsyncMock()
+
+        await adapter._process_message_background(event, build_session_key(source))
+
+        adapter.extract_media.assert_not_called()
+        adapter.extract_images.assert_not_called()
+        adapter.extract_local_files.assert_not_called()
+        adapter.send.assert_awaited_once()
+        send_call = adapter.send.await_args
+        assert send_call is not None
+        assert send_call.kwargs["content"] == response
+        adapter.send_multiple_images.assert_not_awaited()
+        adapter.send_document.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_ingress_handler_exception_fails_closed_without_leaking_error(self, capsys):
