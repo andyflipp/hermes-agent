@@ -12357,8 +12357,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _maybe_results = await _maybe_results
                 if isinstance(_maybe_results, list):
                     _ingress_results = _maybe_results
+                else:
+                    # A decision dispatcher returning a malformed container is
+                    # itself a handled-contract failure, never an LLM fallback.
+                    _ingress_results = [{"handled": True}]
             except Exception:
-                logger.debug("ingress hook dispatch failed", exc_info=True)
+                # Do not include exception text: a private handler may attach
+                # raw platform identifiers or business payloads to it.
+                logger.warning("ingress hook dispatch failed (details suppressed)")
+                _ingress_results = [{"handled": True}]
         _ingress_response = resolve_ingress_hook_decision(_ingress_results)
         if _ingress_response is not None:
             # The outer turn wrapper must not run goal-continuation judging on

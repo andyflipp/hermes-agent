@@ -18,7 +18,9 @@ Events:
   - agent:end           -- Agent finishes processing
   - command:*           -- Any slash command executed (wildcard match)
 
-Errors in hooks are caught and logged but never block the main pipeline.
+Errors in notification hooks are caught and logged without blocking the main
+pipeline. ``ingress:message`` is fail-closed because a handler may already
+have performed an external side effect before returning.
 
 Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   platform     -- source platform name (e.g. "telegram", "matrix", "slack")
@@ -50,26 +52,62 @@ from hermes_cli.config import get_hermes_home
 
 HOOKS_DIR = get_hermes_home() / "hooks"
 
+_INGRESS_TERMINAL_WRITES = {
+    "CREATED_READBACK_PASS": 1,
+    "DUPLICATE_NO_WRITE": 0,
+    "EXCEPTION_NO_WRITE": 0,
+    "UNCERTAIN_NO_RETRY": 0,
+}
+_INGRESS_TERMINAL_KEYS = {
+    "handled", "status", "writes", "reply_mode", "user_message",
+}
+_INGRESS_FAILURE_RESPONSE = (
+    "⚠️ Локальный обработчик не подтвердил безопасный результат. "
+    "Обработка остановлена без запуска агента."
+)
+
 
 def resolve_ingress_hook_decision(results: List[Any]) -> Optional[str]:
     """Resolve at most one strict ``ingress:message`` handled response.
 
-    A decision hook opts in by returning exactly
-    ``{"handled": True, "response": "..."}``.  Unknown return values are
-    ignored so existing notification hooks remain compatible.  Multiple
-    handlers claiming the same message fail closed rather than choosing an
-    order-dependent winner.
+    A decision hook opts in with either the legacy exact response shape or the
+    exact five-key terminal orchestration shape. Unknown unhandled values are
+    ignored for notification-hook compatibility. Once a handler claims a
+    message, malformed output and multiple claims fail closed rather than
+    falling through to an LLM or choosing an order-dependent winner.
     """
     decisions: List[str] = []
+    malformed_claim = False
     for result in results:
         if not isinstance(result, dict) or result.get("handled") is not True:
             continue
-        if set(result) - {"handled", "response"}:
+        if set(result) == {"handled", "response"}:
+            response = result.get("response")
+            if isinstance(response, str) and response.strip():
+                decisions.append(response.strip())
+            else:
+                malformed_claim = True
             continue
-        response = result.get("response")
-        if not isinstance(response, str) or not response.strip():
+        if set(result) == _INGRESS_TERMINAL_KEYS:
+            status = result.get("status")
+            writes = result.get("writes")
+            message = result.get("user_message")
+            if (
+                isinstance(status, str)
+                and status in _INGRESS_TERMINAL_WRITES
+                and type(writes) is int
+                and writes == _INGRESS_TERMINAL_WRITES[status]
+                and result.get("reply_mode") == "SAME_THREAD"
+                and isinstance(message, str)
+                and 0 < len(message.strip()) <= 256
+            ):
+                decisions.append(message.strip())
+            else:
+                malformed_claim = True
             continue
-        decisions.append(response.strip())
+        malformed_claim = True
+    if malformed_claim:
+        return _INGRESS_FAILURE_RESPONSE
     if not decisions:
         return None
     if len(decisions) > 1:
@@ -254,5 +292,12 @@ class HookRegistry:
                 if result is not None:
                     results.append(result)
             except Exception as e:
-                print(f"[hooks] Error in handler for '{event_type}': {e}", flush=True)
+                if event_type == "ingress:message":
+                    # Exception text may contain raw identifiers or payloads.
+                    # Return a malformed handled sentinel so the ingress
+                    # resolver fails closed without logging those details.
+                    print("[hooks] Error in ingress handler (details suppressed)", flush=True)
+                    results.append({"handled": True})
+                else:
+                    print(f"[hooks] Error in handler for '{event_type}': {e}", flush=True)
         return results

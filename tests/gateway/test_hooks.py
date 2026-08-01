@@ -1,9 +1,9 @@
 """Tests for gateway/hooks.py — event hook system."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from types import SimpleNamespace
 
 from gateway.hooks import HookRegistry, resolve_ingress_hook_decision
 
@@ -32,15 +32,69 @@ class TestIngressDecision:
     def test_ignores_unhandled_and_unknown_shapes(self):
         assert resolve_ingress_hook_decision([
             None,
+            "notification result",
             {"handled": False, "response": "no"},
-            {"handled": True, "response": "x", "extra": True},
-            {"handled": True, "response": ""},
+            {"notification": "complete"},
         ]) is None
 
     def test_accepts_one_strict_handled_response(self):
         assert resolve_ingress_hook_decision([
             {"handled": True, "response": "  accepted  "},
         ]) == "accepted"
+
+    @pytest.mark.parametrize(
+        ("status", "writes"),
+        [
+            ("CREATED_READBACK_PASS", 1),
+            ("DUPLICATE_NO_WRITE", 0),
+            ("EXCEPTION_NO_WRITE", 0),
+            ("UNCERTAIN_NO_RETRY", 0),
+        ],
+    )
+    def test_accepts_exact_terminal_orchestration_response(self, status, writes):
+        result = {
+            "handled": True,
+            "status": status,
+            "writes": writes,
+            "reply_mode": "SAME_THREAD",
+            "user_message": "  Безопасный итог.  ",
+        }
+
+        assert resolve_ingress_hook_decision([result]) == "Безопасный итог."
+        assert set(result) == {
+            "handled", "status", "writes", "reply_mode", "user_message",
+        }
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            {"handled": True, "status": "UNKNOWN", "writes": 0,
+             "reply_mode": "SAME_THREAD", "user_message": "x"},
+            {"handled": True, "status": "CREATED_READBACK_PASS", "writes": 0,
+             "reply_mode": "SAME_THREAD", "user_message": "x"},
+            {"handled": True, "status": "DUPLICATE_NO_WRITE", "writes": True,
+             "reply_mode": "SAME_THREAD", "user_message": "x"},
+            {"handled": True, "status": "EXCEPTION_NO_WRITE", "writes": 0,
+             "reply_mode": "NEW_THREAD", "user_message": "x"},
+            {"handled": True, "status": "UNCERTAIN_NO_RETRY", "writes": 0,
+             "reply_mode": "SAME_THREAD", "user_message": ""},
+            {"handled": True, "status": "DUPLICATE_NO_WRITE", "writes": 0,
+             "reply_mode": "SAME_THREAD", "user_message": "x", "raw_id": "secret"},
+            {"handled": True, "status": "DUPLICATE_NO_WRITE", "writes": 0,
+             "reply_mode": "SAME_THREAD"},
+            {"handled": True, "status": {}, "writes": 0,
+             "reply_mode": "SAME_THREAD", "user_message": "x"},
+            {"handled": True, "status": "DUPLICATE_NO_WRITE", "writes": 0,
+             "reply_mode": "SAME_THREAD", "user_message": "x" * 257},
+            {"handled": True, "response": "x", "extra": True},
+        ],
+    )
+    def test_malformed_handled_output_fails_closed(self, malformed):
+        response = resolve_ingress_hook_decision([malformed])
+
+        assert response is not None
+        assert "остановлена" in response
+        assert "secret" not in response
 
     def test_multiple_claims_fail_closed(self):
         response = resolve_ingress_hook_decision([
@@ -87,6 +141,111 @@ class TestIngressDecision:
         assert "raw-chat-456" not in logs
         assert "raw-thread-789" not in logs
         assert "/private/cached.pdf" not in logs
+
+    @pytest.mark.asyncio
+    async def test_terminal_message_bypasses_session_and_agent_in_same_thread(self, caplog):
+        from gateway.run import GatewayRunner
+        from gateway.session import Platform
+
+        class Hooks:
+            async def emit_collect(self, event_type, context):
+                return [{
+                    "handled": True,
+                    "status": "DUPLICATE_NO_WRITE",
+                    "writes": 0,
+                    "reply_mode": "SAME_THREAD",
+                    "user_message": "Повторная запись не выполнялась.",
+                }]
+
+        class ForbiddenSessionStore:
+            async def get_or_create_session(self, _source):
+                raise AssertionError("terminal ingress must bypass session creation")
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        object.__setattr__(runner, "hooks", Hooks())
+        object.__setattr__(runner, "_async_session_store", ForbiddenSessionStore())
+        source = SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            user_id="raw-user-terminal",
+            chat_id="raw-chat-terminal",
+            thread_id="48380",
+            chat_type="dm",
+        )
+        event = SimpleNamespace(
+            source=source,
+            text="",
+            message_id="raw-message-terminal",
+            message_type=SimpleNamespace(value="document"),
+            media_urls=["/private/terminal.pdf"],
+            media_types=["application/pdf"],
+        )
+
+        result = await runner._handle_message_with_agent(event, source, "key", 1)
+
+        assert result == "Повторная запись не выполнялась."
+        assert event._ingress_hook_handled is True
+        assert event.source is source
+        assert event.source.thread_id == "48380"
+        assert "raw-user-terminal" not in caplog.text
+        assert "raw-chat-terminal" not in caplog.text
+        assert "raw-message-terminal" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_ingress_handler_exception_fails_closed_without_leaking_error(self, capsys):
+        reg = HookRegistry()
+
+        def _raises(_event_type, _context):
+            raise RuntimeError("raw-user-should-not-be-logged")
+
+        reg._handlers["ingress:message"] = [_raises]
+
+        results = await reg.emit_collect("ingress:message", {})
+        response = resolve_ingress_hook_decision(results)
+
+        assert response is not None
+        assert "остановлена" in response
+        assert "raw-user-should-not-be-logged" not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_ingress_dispatch_exception_bypasses_session_without_leaking_error(self, caplog):
+        from gateway.run import GatewayRunner
+        from gateway.session import Platform
+
+        class Hooks:
+            async def emit_collect(self, _event_type, _context):
+                raise RuntimeError("raw-business-payload-should-not-be-logged")
+
+        class ForbiddenSessionStore:
+            async def get_or_create_session(self, _source):
+                raise AssertionError("failed ingress dispatch must bypass session creation")
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        object.__setattr__(runner, "hooks", Hooks())
+        object.__setattr__(runner, "_async_session_store", ForbiddenSessionStore())
+        source = SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            user_id="raw-user-dispatch",
+            chat_id="raw-chat-dispatch",
+            thread_id="48380",
+            chat_type="dm",
+        )
+        event = SimpleNamespace(
+            source=source,
+            text="",
+            message_id="raw-message-dispatch",
+            message_type=SimpleNamespace(value="document"),
+            media_urls=["/private/dispatch.pdf"],
+            media_types=["application/pdf"],
+        )
+
+        result = await runner._handle_message_with_agent(event, source, "key", 1)
+
+        assert "остановлена" in result
+        assert event._ingress_hook_handled is True
+        assert event.source.thread_id == "48380"
+        assert "raw-business-payload-should-not-be-logged" not in caplog.text
+        assert "raw-user-dispatch" not in caplog.text
+        assert "/private/dispatch.pdf" not in caplog.text
 
 
 def _patch_no_builtins(reg):

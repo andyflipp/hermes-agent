@@ -86,11 +86,19 @@ async def handle(event_type: str, context: dict):
 
 `ingress:message` is the only decision-style gateway event. A trusted local
 handler may consume the message by returning exactly
-`{"handled": true, "response": "user-visible text"}`. Any other return value
-falls through to the normal agent. If more than one handler claims a message,
-Hermes fails closed and does not choose an order-dependent winner. Keep
-handlers bounded and sanitize their response: cached paths and platform IDs
-must not be echoed to the user.
+`{"handled": true, "response": "user-visible text"}`. Terminal orchestration
+handlers may instead return exactly five keys: `handled`, `status`, `writes`,
+`reply_mode`, and `user_message`. `reply_mode` must be `SAME_THREAD`; `writes`
+must be `1` only for `CREATED_READBACK_PASS` and `0` for
+`DUPLICATE_NO_WRITE`, `EXCEPTION_NO_WRITE`, or `UNCERTAIN_NO_RETRY`.
+
+Unknown values that do not claim the message fall through to the normal
+agent. After `handled: true`, however, malformed output, a handler exception,
+or multiple claims fail closed before session creation or any LLM call. Keep
+handlers bounded and sanitize their output: return only the exact contract,
+use SHA-256 references rather than raw platform/business identifiers in
+private intermediary contracts, and never echo cached paths, payloads, or raw
+IDs in `user_message` or logs.
 
 #### Wildcard Matching
 
