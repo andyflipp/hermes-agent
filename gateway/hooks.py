@@ -67,6 +67,17 @@ _INGRESS_FAILURE_RESPONSE = (
 )
 
 
+def _is_safe_terminal_user_message(message: str) -> bool:
+    """Keep deterministic terminal replies text-only at the gateway boundary.
+
+    Normal gateway responses are later scanned for native media directives.
+    A document-derived ``user_message`` must therefore never be able to turn a
+    terminal receipt into a local-file attachment request.
+    """
+    folded = message.casefold()
+    return "\x00" not in message and "media:" not in folded and "[[" not in message
+
+
 def resolve_ingress_hook_decision(results: List[Any]) -> Optional[str]:
     """Resolve at most one strict ``ingress:message`` handled response.
 
@@ -100,6 +111,7 @@ def resolve_ingress_hook_decision(results: List[Any]) -> Optional[str]:
                 and result.get("reply_mode") == "SAME_THREAD"
                 and isinstance(message, str)
                 and 0 < len(message.strip()) <= 256
+                and _is_safe_terminal_user_message(message)
             ):
                 decisions.append(message.strip())
             else:
