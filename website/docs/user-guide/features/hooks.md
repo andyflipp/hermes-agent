@@ -75,6 +75,7 @@ async def handle(event_type: str, context: dict):
 | Event | When it fires | Context keys |
 |-------|---------------|--------------|
 | `gateway:startup` | Gateway process starts | `platforms` (list of active platform names) |
+| `ingress:message` | Authorized inbound message after media is cached, before any LLM call | `platform`, `user_id`, `chat_id`, `thread_id`, `chat_type`, `message_id`, `message_type`, `text`, `media_urls`, `media_types` |
 | `session:start` | New messaging session created | `platform`, `user_id`, `session_id`, `session_key` |
 | `session:end` | Session ended (before reset) | `platform`, `user_id`, `session_key` |
 | `session:reset` | User ran `/new` or `/reset` | `platform`, `user_id`, `session_key` |
@@ -82,6 +83,14 @@ async def handle(event_type: str, context: dict):
 | `agent:step` | Each iteration of the tool-calling loop | `platform`, `user_id`, `session_id`, `iteration`, `tool_names` |
 | `agent:end` | Agent finishes processing | `platform`, `user_id`, `session_id`, `message`, `response` |
 | `command:*` | Any slash command executed | `platform`, `user_id`, `command`, `args` |
+
+`ingress:message` is the only decision-style gateway event. A trusted local
+handler may consume the message by returning exactly
+`{"handled": true, "response": "user-visible text"}`. Any other return value
+falls through to the normal agent. If more than one handler claims a message,
+Hermes fails closed and does not choose an order-dependent winner. Keep
+handlers bounded and sanitize their response: cached paths and platform IDs
+must not be echoed to the user.
 
 #### Wildcard Matching
 

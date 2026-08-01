@@ -11773,7 +11773,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                if _final_text.strip() and not getattr(event, "_ingress_hook_handled", False):
                     try:
                         session_entry = await self.async_session_store.get_or_create_session(source)
                     except Exception:
@@ -12330,6 +12330,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        # Give trusted local ingress hooks one deterministic chance to consume a
+        # fully downloaded message before logging raw routing identifiers,
+        # touching session state, enriching media, or making any LLM call.
+        # Context contains copied scalar/list fields only.
+        from gateway.hooks import resolve_ingress_hook_decision
+
+        _ingress_context = {
+            "platform": source.platform.value if source.platform else "",
+            "user_id": source.user_id,
+            "chat_id": source.chat_id or "",
+            "thread_id": str(source.thread_id) if source.thread_id else "",
+            "chat_type": source.chat_type or "",
+            "message_id": str(getattr(event, "message_id", "") or ""),
+            "message_type": str(getattr(getattr(event, "message_type", None), "value", getattr(event, "message_type", "")) or ""),
+            "text": (getattr(event, "text", "") or "")[:500],
+            "media_urls": list(getattr(event, "media_urls", None) or []),
+            "media_types": list(getattr(event, "media_types", None) or []),
+        }
+        _ingress_results = []
+        _emit_collect = getattr(getattr(self, "hooks", None), "emit_collect", None)
+        if callable(_emit_collect):
+            try:
+                _maybe_results = _emit_collect("ingress:message", _ingress_context)
+                if inspect.isawaitable(_maybe_results):
+                    _maybe_results = await _maybe_results
+                if isinstance(_maybe_results, list):
+                    _ingress_results = _maybe_results
+            except Exception:
+                logger.debug("ingress hook dispatch failed", exc_info=True)
+        _ingress_response = resolve_ingress_hook_decision(_ingress_results)
+        if _ingress_response is not None:
+            # The outer turn wrapper must not run goal-continuation judging on
+            # this deterministic response; that would reintroduce an LLM call.
+            event._ingress_hook_handled = True
+            logger.info(
+                "Ingress hook handled message: platform=%s media=%d",
+                source.platform.value if source.platform else "",
+                len(getattr(event, "media_urls", None) or []),
+            )
+            return _ingress_response
+
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")

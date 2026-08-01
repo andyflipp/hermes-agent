@@ -8,6 +8,8 @@ Hooks are discovered from ~/.hermes/hooks/ directories, each containing:
 
 Events:
   - gateway:startup     -- Gateway process starts
+  - ingress:message     -- Downloaded inbound message before the agent runs;
+                           handlers may return a bounded handled response
   - session:start       -- New session created (first message of a new session)
   - session:end         -- Session ends (user ran /new or /reset)
   - session:reset       -- Session reset completed (new session entry created)
@@ -47,6 +49,35 @@ from hermes_cli.config import get_hermes_home
 
 
 HOOKS_DIR = get_hermes_home() / "hooks"
+
+
+def resolve_ingress_hook_decision(results: List[Any]) -> Optional[str]:
+    """Resolve at most one strict ``ingress:message`` handled response.
+
+    A decision hook opts in by returning exactly
+    ``{"handled": True, "response": "..."}``.  Unknown return values are
+    ignored so existing notification hooks remain compatible.  Multiple
+    handlers claiming the same message fail closed rather than choosing an
+    order-dependent winner.
+    """
+    decisions: List[str] = []
+    for result in results:
+        if not isinstance(result, dict) or result.get("handled") is not True:
+            continue
+        if set(result) - {"handled", "response"}:
+            continue
+        response = result.get("response")
+        if not isinstance(response, str) or not response.strip():
+            continue
+        decisions.append(response.strip())
+    if not decisions:
+        return None
+    if len(decisions) > 1:
+        return (
+            "⚠️ Несколько локальных обработчиков заявили права на это сообщение. "
+            "Обработка остановлена без запуска агента."
+        )
+    return decisions[0]
 
 
 class HookRegistry:
