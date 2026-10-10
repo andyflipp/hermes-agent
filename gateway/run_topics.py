@@ -484,6 +484,14 @@ class GatewayTopicThreadsMixin:
             "Telegram topic title rename",
         )
 
+    def _telegram_topic_title_style(self, source: SessionSource) -> str | None:
+        """Explicit per-transport opt-in; never infer behaviour from SOUL."""
+        from agent.telegram_title_policy import TITLE_STYLE
+        config = getattr(self, "config", None)
+        cfg = config.platforms.get(source.platform) if config and getattr(config, "platforms", None) else None
+        policy = (getattr(cfg, "extra", None) or {}).get("topic_naming_policy")
+        return TITLE_STYLE if policy == TITLE_STYLE else None
+
     def _telegram_topic_auto_rename_disabled(self, source: SessionSource) -> bool:
         """``gateway.platforms.telegram.extra.disable_topic_auto_rename``; default False (auto-rename on)."""
         config = getattr(self, "config", None)
@@ -528,19 +536,35 @@ class GatewayTopicThreadsMixin:
         if adapter is None:
             return
         topic_name = self._sanitize_telegram_topic_title(title)
+        icon_kwargs = {}
+        if self._telegram_topic_title_style(source):
+            resolver = getattr(adapter, "topic_icon_for_title", None)
+            if callable(resolver):
+                try:
+                    icon_id = await resolver(topic_name)
+                except Exception:
+                    logger.warning("Telegram topic icon resolution failed; title-only update is partial", exc_info=True)
+                    icon_id = None
+                if icon_id:
+                    icon_kwargs["icon_custom_emoji_id"] = icon_id
+                else:
+                    logger.warning("Telegram topic icon unavailable; title-only update is partial")
         try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
             if rename_topic is not None:
-                await rename_topic(chat_id=str(source.chat_id), thread_id=str(source.thread_id), name=topic_name)
+                await rename_topic(chat_id=str(source.chat_id), thread_id=str(source.thread_id), name=topic_name, **icon_kwargs)
                 return
             bot = getattr(adapter, "_bot", None)
             edit_forum_topic = getattr(bot, "edit_forum_topic", None) or getattr(bot, "editForumTopic", None)
             if edit_forum_topic is None:
                 return
             try:
-                await edit_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), name=topic_name)
+                chat_id_arg, thread_id_arg = int(source.chat_id), int(source.thread_id)
             except (TypeError, ValueError):
-                await edit_forum_topic(chat_id=source.chat_id, message_thread_id=source.thread_id, name=topic_name)
+                chat_id_arg, thread_id_arg = source.chat_id, source.thread_id
+            # Coerce before dispatch: a transport exception does not prove that
+            # Telegram rejected the write, so never retry with alternate types.
+            await edit_forum_topic(chat_id=chat_id_arg, message_thread_id=thread_id_arg, name=topic_name, **icon_kwargs)
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 

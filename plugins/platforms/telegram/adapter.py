@@ -2664,7 +2664,33 @@ class TelegramAdapter(BasePlatformAdapter):
         self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
         return str(thread_id)
 
-    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str) -> None:
+    async def topic_icon_for_title(self, title: str) -> Optional[str]:
+        """Resolve an appropriate native icon against this bot's live catalogue."""
+        from agent.telegram_title_policy import select_icon
+        if not self._bot:
+            return None
+        lock = getattr(self, "_topic_icon_lock", None)
+        if lock is None:
+            lock = self._topic_icon_lock = asyncio.Lock()
+        async with lock:
+            now = time.monotonic()
+            if now >= getattr(self, "_topic_icon_expiry", 0):
+                try:
+                    stickers = await self._bot.get_forum_topic_icon_stickers()
+                    self._topic_icon_catalog = {
+                        sticker.emoji: sticker.custom_emoji_id for sticker in stickers
+                        if sticker.emoji and sticker.custom_emoji_id
+                    }
+                    self._topic_icon_expiry = now + 3600
+                except Exception:
+                    # No hard-coded fallback IDs, and no retry storm on an outage.
+                    logger.warning("[%s] Native topic icon catalogue unavailable", self.name)
+                    self._topic_icon_catalog = {}
+                    self._topic_icon_expiry = now + 60
+            return select_icon(title, self._topic_icon_catalog)
+
+    async def rename_dm_topic(self, chat_id: int | str, thread_id: int | str, name: str,
+                              *, icon_custom_emoji_id: Optional[str] = None) -> None:
         """Rename a forum topic in a private (DM) chat."""
         if not self._bot:
             return
@@ -2672,7 +2698,8 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id_arg = int(chat_id)
         except (TypeError, ValueError):
             chat_id_arg = chat_id
-        await self._bot.edit_forum_topic(chat_id=chat_id_arg, message_thread_id=int(thread_id), name=name)
+        icon_kwargs = {"icon_custom_emoji_id": icon_custom_emoji_id} if icon_custom_emoji_id else {}
+        await self._bot.edit_forum_topic(chat_id=chat_id_arg, message_thread_id=int(thread_id), name=name, **icon_kwargs)
         logger.info("[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'", self.name, chat_id, thread_id, name)
 
     def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int, replace_existing: bool = False) -> None:
