@@ -227,6 +227,7 @@ def _maybe_title_session_at_turn_start(
                 and getattr(agent, "provider", None) == main_runtime["provider"]
             ),
             title_preview=title_preview,
+            **({"title_style": agent._title_style} if getattr(agent, "_title_style", None) else {}),
         )
         # Unstarted = the title call would share a self-hosted endpoint with this turn's request
         # (#117296); ``finalize_turn`` starts it once the model has answered.

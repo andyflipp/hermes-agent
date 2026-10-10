@@ -19,6 +19,7 @@ from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.message_content import flatten_message_text
+from agent.telegram_title_policy import TITLE_STYLE, SHORT_PROMPT, MAX_WORDS, requested_title, short_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +476,7 @@ def generate_title(
     main_runtime: dict = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     title_preview: str | None = None,
+    title_style: str | None = None,
 ) -> Optional[str]:
     """Title from the opening message alone (waiting for the assistant made this slow and bought
     nothing). ``runtime_validator`` runs right before the request; False skips silently.
@@ -502,7 +504,7 @@ def generate_title(
         return None
     language = _title_language()
     # str.replace, not str.format: the prompt embeds literal JSON braces.
-    prompt = _TITLE_PROMPT_TEMPLATE.replace(
+    prompt = (SHORT_PROMPT if title_style == TITLE_STYLE else _TITLE_PROMPT_TEMPLATE).replace(
         "__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER,
     )
     try:
@@ -536,9 +538,10 @@ def generate_title(
         # something I recognize..."). Truncating would store half an assistant blob as the session title,
         # which is still an assistant blob — reject instead so the caller retries on the next exchange
         # (maybe_auto_title retries a placeholder title through the third exchange). Port of can1357/oh-my-pi#7306.
-        if title is not None and len(title.split()) > _MAX_TITLE_WORDS:
+        max_words = MAX_WORDS if title_style == TITLE_STYLE else _MAX_TITLE_WORDS
+        if title is not None and len(title.split()) > max_words:
             # Answer-shaped output: reject (not truncate) so the caller retries next exchange.
-            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), _MAX_TITLE_WORDS)
+            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), max_words)
             return None
         # Example-echo guard: a title that parrots one of the prompt's own
         # examples back verbatim says nothing about the session — reject it so
@@ -648,6 +651,7 @@ def auto_title_session(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     title_preview: str | None = None,
+    title_style: str | None = None,
 ) -> None:
     """Generate and store the model title (daemon-thread target); skips sessions already carrying an
     ``llm``/``user`` title (a ``derived`` one is expected — upgrading it is the point). Never lets an
@@ -667,14 +671,18 @@ def auto_title_session(
         # Same for the accounting context, so the title call's token usage is recorded against this session
         # (task='title_generation', #23270).
         set_accounting_context(session_db, session_id)
+        style_kwargs: dict[str, Any] = {"title_style": title_style} if title_style else {}
         title, source = generate_title(
             user_message, failure_callback=failure_callback, main_runtime=main_runtime,
             runtime_validator=runtime_validator, title_preview=title_preview,
+            **style_kwargs,
         ), "llm"
         if title and _is_provisional_greeting_title(title):
             source = "derived"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
             title, source = derive_title(user_message, title_preview), "derived"
+            if title_style == TITLE_STYLE:
+                title = short_fallback(title)
         if not title:
             return
         try:
@@ -743,6 +751,7 @@ def maybe_auto_title(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     title_preview: str | None = None,
+    title_style: str | None = None,
 ) -> Optional[threading.Thread]:
     """Instant inline title, then a daemon-thread upgrade. Call at the START of a turn, before the model.
 
@@ -776,7 +785,34 @@ def maybe_auto_title(
     if not _auto_title_enabled():  # config read after the cheap guards so the file isn't touched every turn
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return None
-    apply_instant_title(session_db, session_id, user_message, title_callback, title_preview=title_preview)
+    if title_style == TITLE_STYLE:
+        try:
+            explicit = requested_title(user_message)
+        except ValueError:
+            logger.warning("Explicit topic title cannot be applied literally; operator input required")
+            return None
+        if explicit:
+            # Final automatic authority, like Kanban's human-written card title.
+            # Atomic provenance prevents this path replacing a manual /title.
+            try:
+                from hermes_state import SessionDB
+                if SessionDB.sanitize_title(explicit) != explicit:
+                    logger.warning("Explicit topic title would be normalized; operator input required")
+                    return None
+                persisted = _persist_session_title(session_db, session_id, explicit, source="llm", dedupe=False)
+                if persisted:
+                    _notify_title(title_callback, persisted, "llm", "Explicit topic title")
+            except Exception:
+                logger.warning("Explicit topic title could not be stored unchanged", exc_info=True)
+            return None
+        try:
+            derived = short_fallback(derive_title(user_message, title_preview))
+            if derived:
+                _persist_session_title(session_db, session_id, derived, source="derived", dedupe=False)
+        except Exception:
+            logger.debug("Short instant title failed", exc_info=True)
+    else:
+        apply_instant_title(session_db, session_id, user_message, title_callback, title_preview=title_preview)
     if not _model_title_upgrade_enabled():
         logger.debug("Instant title persisted; model upgrade disabled by auxiliary.title_generation.model_upgrade_enabled=false")
         return None
@@ -784,8 +820,10 @@ def maybe_auto_title(
     # profile whose turn this is: a bare Thread starts with an empty context and lands on the launch
     # profile under multiplex, titling X's session with the default profile's model and billing its key.
     from agent.memory_provider import spawn_context_thread
-    upgrade_kwargs = dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback,
+    upgrade_kwargs: dict[str, Any] = dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback,
                           runtime_validator=runtime_validator)
+    if title_style:
+        upgrade_kwargs["title_style"] = title_style
     if isinstance(title_preview, str) and title_preview.strip():
         upgrade_kwargs["title_preview"] = title_preview
     upgrade = spawn_context_thread(
